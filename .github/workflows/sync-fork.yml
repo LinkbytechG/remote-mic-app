@@ -1,0 +1,28 @@
+name: Sync Fork
+
+on:
+  schedule:
+    # Every day at 08:00 CST (UTC 00:00)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync fork with upstream
+        run: |
+          git remote add upstream https://github.com/HD838A/remote-mic-app.git
+          git fetch upstream
+          git merge upstream/main --no-edit
+          git push origin main
