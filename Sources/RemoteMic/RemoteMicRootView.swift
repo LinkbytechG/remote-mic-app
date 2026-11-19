@@ -3,6 +3,8 @@ import SwiftUI
 struct RemoteMicRootView: View {
     let model: BridgeAppModel
     @ObservedObject private var buttonProfileImportRequests: ButtonProfileImportRequestStore
+    /// AppKit 菜单与 ⌘1–⌘9 的导航桥，由 AppDelegate 持有并注入。
+    @ObservedObject private var settingsNavigation: SettingsNavigationStore
     @ObservedObject private var settings: AppSettings
     @ObservedObject private var updateInformation: UpdateInformationStore
     @ObservedObject private var hardwareAnnouncements: HardwareAnnouncementStore
@@ -16,6 +18,7 @@ struct RemoteMicRootView: View {
     init(
         model: BridgeAppModel,
         buttonProfileImportRequests: ButtonProfileImportRequestStore = ButtonProfileImportRequestStore(),
+        settingsNavigation: SettingsNavigationStore = SettingsNavigationStore(),
         updateInformation: UpdateInformationStore,
         hardwareAnnouncements: HardwareAnnouncementStore = HardwareAnnouncementStore(),
         checkForUpdates: @escaping () -> Void,
@@ -27,6 +30,7 @@ struct RemoteMicRootView: View {
     ) {
         self.model = model
         self.buttonProfileImportRequests = buttonProfileImportRequests
+        self.settingsNavigation = settingsNavigation
         settings = model.settings
         self.updateInformation = updateInformation
         self.hardwareAnnouncements = hardwareAnnouncements
@@ -44,6 +48,7 @@ struct RemoteMicRootView: View {
                 SettingsView(
                     model: model,
                     buttonProfileImportRequests: buttonProfileImportRequests,
+                    settingsNavigation: settingsNavigation,
                     updateInformation: updateInformation,
                     hardwareAnnouncements: hardwareAnnouncements,
                     checkForUpdates: checkForUpdates,
@@ -57,6 +62,8 @@ struct RemoteMicRootView: View {
                 OnboardingView(model: model)
             }
         }
+        // 窗口根挂一次：气泡覆盖整个窗口，`noticeAnchor` 上报的坐标也在这套坐标系里换算。
+        .noticeHost()
         .onAppear {
             startRuntimeIfRequired(for: settings.onboardingStep)
         }

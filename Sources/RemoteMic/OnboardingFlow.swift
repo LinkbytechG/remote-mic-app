@@ -173,60 +173,29 @@ enum OnboardingVoiceTool: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// 提示词放在本地化资源中；源码只负责按语言读取，避免长文案和产品配置混在一起。
 enum OnboardingAIAssistantPrompt {
-    private static let configurationCommand = """
-    APP_PATH=""
-    for APP_CANDIDATE in "/Applications/SayAll.app" "/Applications/无线麦SayAll.app" "$HOME/Applications/SayAll.app" "$HOME/Applications/无线麦SayAll.app"; do
-      if test -x "$APP_CANDIDATE/Contents/MacOS/RemoteMic"; then
-        APP_PATH="$APP_CANDIDATE"
-        break
-      fi
-    done
-    if test -z "$APP_PATH"; then
-      printf '%s\\n' '{"status":"not_found","reason":"installed_app","remaining":["app_installation"]}'
-      exit 1
-    fi
-    "$APP_PATH/Contents/MacOS/RemoteMic" --agent-configure --auto --json
-    """
+    private static let resourceName = "OnboardingAIAssistantPrompt"
+    private static let resourceExtension = "txt"
 
-    static let chinese = """
-    请在这台 Mac 上直接完成“无线麦 SayAll”的配置。我的遥控器已经通过蓝牙连接。
-
-    不要操作屏幕、不要点击窗口，也不要只给我操作建议。请使用无线麦 SayAll 提供的本机配置命令，通过终端完成配置并验证结果：
-
-    1. 只在系统和当前用户的 Applications 目录中定位已安装的无线麦 SayAll。未找到时，向我确认安装位置；不要运行测试副本或下载归档：
-       \(configurationCommand.replacingOccurrences(of: "\n", with: "\n   "))
-    2. 自动选择当前已连接的遥控器；如果有多个候选且无法判断，只向我询问一次。
-    3. 自动选择已安装且可用的语音工具：豆包、微信输入法、Vokie、Typeless 或其他工具；如果有多个候选且无法判断，只询问我一次。
-    4. 让本次 Onboarding 使用 Fn，并按控制设备与语音工具匹配的“按住”或“按一次”方式配置。
-    5. 选择可用的无线麦 SayAll 音频输出设备，并保留当前增益。第三方语音工具必须把同一设备选择为麦克风；需要调整增益时，在无线麦 SayAll 真实语音测试页调整。
-    6. 只修改无线麦 SayAll 自己的配置，不读取或修改第三方语音工具的私有文件、数据库、沙盒或未公开协议。
-    7. 配置成功后，将无线麦 SayAll 向导停在真实语音测试步骤，不要跳过语音、音频、按键和文字上屏验证，也不要把写入配置当成验证成功。
-    8. 如果需要 macOS 权限、用户选择或真实说话测试，明确告诉我还缺哪一步；JSON 返回 configured 或 permission_required 只表示 staged 配置已准备，不能表示真实语音验证已完成。
-
-    请使用命令返回的 JSON 结果判断成功或失败，并在失败时说明具体原因。不要伪造完成状态。
-    """
-
-    static let english = """
-    Configure “SayAll” directly on this Mac. My remote is already connected over Bluetooth.
-
-    Do not operate the screen, click windows, or only give instructions. Use the app’s local headless configuration command from the terminal, then verify its result:
-
-    1. Locate SayAll only in the system and current-user Applications folders. If it is not found, ask me for its install location. Do not run test copies or download archives:
-       \(configurationCommand.replacingOccurrences(of: "\n", with: "\n   "))
-    2. Select the currently connected remote automatically; ask me at most once if multiple candidates cannot be distinguished.
-    3. Select an installed and available voice typing app: Doubao, WeType, Vokie, Typeless, or Other; ask me at most once if multiple candidates cannot be distinguished.
-    4. Use Fn for this onboarding run and apply the hold-or-toggle behavior matched to the selected remote and voice typing app.
-    5. Select an available SayAll audio output device and keep the current gain. The third-party voice typing app must select the same device as its microphone; adjust the gain only on SayAll’s real voice-test page if needed.
-    6. Modify only SayAll’s own configuration. Do not read or modify private files, databases, sandboxes, or undocumented protocols of third-party voice typing apps.
-    7. After configuration, leave SayAll at the real voice-test step. Do not skip voice, audio, button, or text-on-screen verification, and do not treat a written configuration as proof of success.
-    8. If macOS permissions, a user choice, or a real spoken test is still required, tell me exactly what remains. A JSON status of configured or permission_required means only that staged configuration is prepared; it does not mean real voice verification is complete.
-
-    Use the command’s JSON result to determine success or failure, and explain the concrete reason if it fails. Never fabricate completion.
-    """
+    static let chinese = load(localization: "zh-Hans")
+    static let english = load(localization: "en")
 
     static func text(for locale: Locale) -> String {
         locale.identifier.lowercased().hasPrefix("zh") ? chinese : english
+    }
+
+    private static func load(localization: String) -> String {
+        guard let url = RemoteMicResourceBundle.mainOrDevelopment.url(
+            forResource: resourceName,
+            withExtension: resourceExtension,
+            subdirectory: nil,
+            localization: localization
+        ),
+        let text = try? String(contentsOf: url, encoding: .utf8) else {
+            return ""
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -430,6 +399,15 @@ enum OnboardingControlSource: String, CaseIterable, Codable, Identifiable {
         case .unselected: return .unselected
         }
     }
+
+    /// 语音音频是否只在按下语音键时建立。
+    ///
+    /// 小米遥控器和 Chromecast 连接成功后蓝牙桥保持 Ready，虚拟音频引擎因此常驻；
+    /// Siri Remote 的音频由 HCI 组件在按键时开始采集，连接本身不启动引擎，按需建立。
+    /// 两者都归为 `physical_remote`，只能按来源区分，不能按控制方式区分。
+    var usesOnDemandAudioOutput: Bool {
+        self == .siriRemote
+    }
 }
 
 /// During the ordinary-button check, Onboarding observes fresh input events but must
@@ -505,6 +483,10 @@ enum OnboardingAppleRemoteGeneration: String, Codable, CaseIterable, Identifiabl
     case generation6 = "generation_6"
     case generation7 = "generation_7"
 
+    /// 页面展示顺序：Type-C 在 Lightning 之前。保留 `allCases` 的声明顺序，
+    /// 避免影响只关心集合而非顺序的调用方。
+    static let displayOrder: [Self] = [.generation7, .generation6]
+
     var id: String { rawValue }
 
     var titleKey: String { "onboarding.control_source.apple_remote.\(rawValue).title" }
@@ -513,6 +495,122 @@ enum OnboardingAppleRemoteGeneration: String, Codable, CaseIterable, Identifiabl
         switch self {
         case .generation6: return .appleSiriRemoteA2540
         case .generation7: return .appleSiriRemoteA2854
+        }
+    }
+}
+
+/// Onboarding 需要用户明确选择的具体小米型号。
+///
+/// 持久化只允许这两个已验证型号；Apple、Chromecast 和 `.unknown` 不属于这个选择。
+enum OnboardingXiaomiRemoteModel: String, Codable, CaseIterable, Identifiable {
+    case rc003
+    case rc001
+
+    var id: String { rawValue }
+
+    var model: XiaomiRemoteModel {
+        switch self {
+        case .rc003: return .rc003
+        case .rc001: return .rc001
+        }
+    }
+
+    var titleKey: String { model.localizationKey }
+    var detailKey: String { "onboarding.control_source.xiaomi_remote.detail" }
+}
+
+/// 控制设备页实际渲染的实体遥控器卡片。
+enum OnboardingPhysicalRemoteCard: Identifiable, Equatable {
+    case xiaomi(OnboardingXiaomiRemoteModel)
+    case apple(OnboardingAppleRemoteGeneration)
+
+    var id: String {
+        switch self {
+        case let .xiaomi(model):
+            return "xiaomi_remote.\(model.rawValue)"
+        case let .apple(generation):
+            return "siri_remote.\(generation.rawValue)"
+        }
+    }
+
+    static func ordered(availableSources: [OnboardingControlSource]) -> [Self] {
+        var cards: [Self] = []
+        if availableSources.contains(.xiaomiRemote) {
+            cards.append(contentsOf: OnboardingXiaomiRemoteModel.allCases.map(Self.xiaomi))
+        }
+        if availableSources.contains(.siriRemote) {
+            cards.append(contentsOf: OnboardingAppleRemoteGeneration.displayOrder.map(Self.apple))
+        }
+        return cards
+    }
+}
+
+enum OnboardingControlSourceSelectionPolicy {
+    static func isComplete(
+        source: OnboardingControlSource,
+        xiaomiModel: OnboardingXiaomiRemoteModel?
+    ) -> Bool {
+        guard source != .unselected else { return false }
+        guard source == .xiaomiRemote else { return true }
+        return xiaomiModel != nil
+    }
+}
+
+/// Onboarding 期间如何对待来自某个小米档案的按键或语音事件。
+enum OnboardingXiaomiEventDisposition: Equatable {
+    /// 事件来自用户选择的型号，可以进入现有门禁。
+    case accept
+    /// 档案型号尚未识别；可以暂存第一条证据，但型号确认前不能通过。
+    case pendingIdentity
+    /// 事件来自另一只已识别的小米遥控器；不得改变选择或满足门禁。
+    case rejectOtherModel
+
+    var logValue: String {
+        switch self {
+        case .accept: return "accepted"
+        case .pendingIdentity: return "pending_identity"
+        case .rejectOtherModel: return "profile_mismatch"
+        }
+    }
+}
+
+enum OnboardingXiaomiEventPolicy {
+    static func disposition(
+        profileModel: XiaomiRemoteModel?,
+        selectedModel: OnboardingXiaomiRemoteModel?,
+        controlSource: OnboardingControlSource
+    ) -> OnboardingXiaomiEventDisposition {
+        guard controlSource == .xiaomiRemote, let selectedModel else { return .accept }
+        switch profileModel {
+        case .rc001?, .rc003?:
+            return profileModel == selectedModel.model ? .accept : .rejectOtherModel
+        case .unknown?, .none:
+            return .pendingIdentity
+        case .appleSiriRemoteA2854?, .appleSiriRemoteA2540?,
+             .chromecastVoiceRemote?:
+            return .rejectOtherModel
+        }
+    }
+
+    /// 未识别档案只有在所选型号还没有可用档案时才接管当前选择。
+    /// 所选型号已经有档案时，未知档案不能把 HID/语音路由切走。
+    static func shouldAdoptSelection(
+        profileModel: XiaomiRemoteModel?,
+        selectedModel: OnboardingXiaomiRemoteModel?,
+        selectedModelProfileExists: Bool,
+        controlSource: OnboardingControlSource
+    ) -> Bool {
+        switch disposition(
+            profileModel: profileModel,
+            selectedModel: selectedModel,
+            controlSource: controlSource
+        ) {
+        case .accept:
+            return true
+        case .pendingIdentity:
+            return !selectedModelProfileExists
+        case .rejectOtherModel:
+            return false
         }
     }
 }
@@ -691,15 +789,17 @@ enum OnboardingRemotePhotoKind: Equatable {
 
     static func resolve(
         source: OnboardingControlSource,
-        selectedModel: XiaomiRemoteModel?
+        selectedModel: XiaomiRemoteModel?,
+        onboardingXiaomiModel: OnboardingXiaomiRemoteModel? = nil
     ) -> Self {
         switch source {
         case .xiaomiRemote:
             // Only a Xiaomi profile may refine the image. A previously selected
             // Apple/Chromecast profile must never replace the Xiaomi card artwork.
-            if let selectedModel,
-               selectedModel == .rc001 || selectedModel == .rc003 {
-                guard let resource = VoiceRemoteCatalog.photoResource(for: selectedModel) else {
+            let preferredModel = onboardingXiaomiModel?.model ?? selectedModel
+            if let preferredModel,
+               preferredModel == .rc001 || preferredModel == .rc003 {
+                guard let resource = VoiceRemoteCatalog.photoResource(for: preferredModel) else {
                     return .placeholder
                 }
                 return .bundled(resourceName: resource)
@@ -791,6 +891,32 @@ enum OnboardingAudioSelectionPolicy {
     }
 }
 
+/// 音频页与完成页的音频门禁。
+///
+/// 语音音频按需建立的来源（iPhone、网页版、Siri Remote）只要选中受支持的设备且该设备仍在
+/// 列表里就能继续，真实输出由下一页的会话、PCM、停止和文字验证；其他实体遥控器在连接期间
+/// 常驻输出引擎，仍然要求持续 Ready。把 Siri Remote 一起按持续 Ready 要求会让只有一只
+/// Siri Remote 的用户永远停在这一页：连接遥控器不会启动引擎，重试也只是重复同一个判断。
+enum OnboardingAudioReadinessPolicy {
+    static func usesOnDemandAudioOutput(
+        controlMethod: OnboardingControlMethod,
+        controlSource: OnboardingControlSource
+    ) -> Bool {
+        controlMethod.usesOnDemandAudioOutput || controlSource.usesOnDemandAudioOutput
+    }
+
+    static func isSatisfied(
+        controlMethod: OnboardingControlMethod,
+        controlSource: OnboardingControlSource,
+        audioOutputSelected: Bool,
+        audioReady: Bool
+    ) -> Bool {
+        audioOutputSelected &&
+            (usesOnDemandAudioOutput(controlMethod: controlMethod, controlSource: controlSource) ||
+                audioReady)
+    }
+}
+
 enum OnboardingTranscriptInputPolicy {
     private static let keyDownEventTypeRawValue: UInt = 10
     private static let hidSystemStateRawValue: Int64 = 1
@@ -846,6 +972,7 @@ enum OnboardingFlowPolicy {
         voiceTool: OnboardingVoiceTool,
         remoteAvailability: OnboardingRemoteAvailability = .hasRemote,
         controlMethod: OnboardingControlMethod = .physicalRemote,
+        controlSource: OnboardingControlSource = .unselected,
         voiceKeyMode: VoiceKeyMode = .function,
         capabilities: OnboardingCapabilities,
         phoneAppInstallConfirmed: Bool = true
@@ -876,8 +1003,12 @@ enum OnboardingFlowPolicy {
         case .remote:
             return capabilities.remoteConnected && capabilities.remoteButtonObserved
         case .audio:
-            return capabilities.audioOutputSelected &&
-                (controlMethod.usesOnDemandAudioOutput || capabilities.audioReady)
+            return OnboardingAudioReadinessPolicy.isSatisfied(
+                controlMethod: controlMethod,
+                controlSource: controlSource,
+                audioOutputSelected: capabilities.audioOutputSelected,
+                audioReady: capabilities.audioReady
+            )
         case .voiceTest:
             return capabilities.voiceSessionStarted &&
                 capabilities.voiceSamplesReceived &&
@@ -896,8 +1027,12 @@ enum OnboardingFlowPolicy {
                     capabilities.inputMonitoringGranted) &&
                 capabilities.accessibilityGranted &&
                 capabilities.remoteConnected &&
-                capabilities.audioOutputSelected &&
-                (controlMethod.usesOnDemandAudioOutput || capabilities.audioReady)
+                OnboardingAudioReadinessPolicy.isSatisfied(
+                    controlMethod: controlMethod,
+                    controlSource: controlSource,
+                    audioOutputSelected: capabilities.audioOutputSelected,
+                    audioReady: capabilities.audioReady
+                )
         }
     }
 
@@ -906,6 +1041,7 @@ enum OnboardingFlowPolicy {
         voiceTool: OnboardingVoiceTool,
         remoteAvailability: OnboardingRemoteAvailability = .hasRemote,
         controlMethod: OnboardingControlMethod = .physicalRemote,
+        controlSource: OnboardingControlSource = .unselected,
         capabilities: OnboardingCapabilities,
         hasSelectedAudioUID: Bool
     ) -> OnboardingStep? {
@@ -913,6 +1049,7 @@ enum OnboardingFlowPolicy {
             step: step,
             remoteAvailability: remoteAvailability,
             controlMethod: controlMethod,
+            controlSource: controlSource,
             capabilities: capabilities,
             hasSelectedAudioUID: hasSelectedAudioUID
         )

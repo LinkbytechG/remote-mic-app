@@ -75,6 +75,31 @@ struct ChromecastIntegrationTests {
         #expect(!ChromecastVoiceEndReason.cancelled("link_unavailable").isNormal)
     }
 
+    /// 按键已经响应，但私有包的 presence 缓存还没有值时，卡片必须读取实时快照，
+    /// 不能停在 `.unknown` 并显示“状态确认中”。
+    @Test func cardButtonReadinessUsesLiveHIDPresenceWhenCacheIsMissing() {
+        #expect(RemoteFunctionReadiness.chromecastButtons(
+            cachedPresent: nil,
+            livePresent: true
+        ) == .ready)
+        #expect(RemoteFunctionReadiness.chromecastButtons(
+            cachedPresent: nil,
+            livePresent: false
+        ) == .unknown)
+        #expect(RemoteFunctionReadiness.chromecastButtons(
+            cachedPresent: true,
+            livePresent: false
+        ) == .ready)
+        #expect(RemoteFunctionReadiness.chromecastButtons(
+            cachedPresent: false,
+            livePresent: true
+        ) == .ready)
+        #expect(RemoteFunctionReadiness.chromecastButtons(
+            cachedPresent: false,
+            livePresent: false
+        ) == .unknown)
+    }
+
     // MARK: - 缺包时的退化行为
 
     @Test func integrationIsInertWhenPrivatePackageIsAbsent() {
@@ -130,8 +155,42 @@ struct ChromecastIntegrationTests {
         #expect(modelSource.contains("#if SAYALL_CHROMECAST_ENABLED"))
         #expect(modelSource.contains("owner: .chromecast"))
         #expect(modelSource.contains("receiveChromecastAudio"))
+        #expect(modelSource.contains("RemoteFunctionReadiness.chromecastButtons"))
         // 缺失私有包必须是普通的代码路径，不能是构建期 fatalError。
         #expect(!packageSource.contains("fatalError(\"SAYALL_CHROMECAST"))
+    }
+
+    /// 「按一次说话 / 按住说话」只属于 Chromecast 的语音键，必须放在语音键设置面板内，
+    /// 不能重新变成按键页底部的常驻区块。
+    @Test func chromecastVoiceModeLivesInsideVoiceKeySettingsPanel() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let settingsView = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+
+        let panelStart = try #require(settingsView.range(of: "private func mappingVoiceSettingsPanel"))
+        let panelEnd = try #require(settingsView.range(
+            of: "private var siriRemoteScrollArrowControl",
+            range: panelStart.upperBound..<settingsView.endIndex
+        ))
+        let panelSource = settingsView[panelStart.lowerBound..<panelEnd.lowerBound]
+        #expect(panelSource.contains(
+            "settings.selectedRemoteProfile?.model.isChromecastRemote == true"
+        ))
+        #expect(panelSource.contains("chromecastVoiceModeControl"))
+
+        let pageStart = try #require(settingsView.range(of: "private func hardwareMappingPage"))
+        let pageEnd = try #require(settingsView.range(
+            of: "private var configurationImportBanner",
+            range: pageStart.upperBound..<settingsView.endIndex
+        ))
+        #expect(!settingsView[pageStart.lowerBound..<pageEnd.lowerBound].contains(
+            "chromecastVoiceModeControl"
+        ))
     }
 
     @Test func chromecastPanelChangesReachTheRuntimeWithoutRestart() throws {
@@ -242,7 +301,7 @@ struct ChromecastIntegrationTests {
     /// Chromecast 设备档案按型号识别并且可重复注册，否则每次连接都会新建一个档案、丢掉映射。
     @Test func chromecastProfileRegistrationIsIdempotent() throws {
         let suiteName = "RemoteMicTests.ChromecastProfile.(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
 

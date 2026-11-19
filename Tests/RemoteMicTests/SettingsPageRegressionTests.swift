@@ -107,7 +107,7 @@ struct SettingsPageRegressionTests {
         #expect(source.contains("button_mapping.hold.repeat_prefix"))
         #expect(source.contains("button_mapping.hold.clear_long_to_enable"))
         // Both hold targets share one card height, so the pair cannot look ragged.
-        #expect(source.contains("minHeight: 62, maxHeight: 62"))
+        #expect(source.contains("minHeight: 108, maxHeight: .infinity"))
         let holdPanelStart = try #require(source.range(of: "private func mappingHoldEditorPanel"))
         let holdPanelEnd = try #require(source.range(
             of: "private func mappingHoldOptionColumn",
@@ -173,17 +173,35 @@ struct SettingsPageRegressionTests {
             "applyDefaultMappingRemoteAfterConnectionChange()"
         ))
 
-        // Chromecast 的「连接即选中」必须经过统一策略：已连接的小米不能被抢占。
+        // 链路就绪不再改选中态。冷启动时 Chromecast 常比小米先 ready，小米 2 秒后才
+        // ready，两边都「连接即选中」就会让画布 小米 → Chromecast → 小米 来回跳。
+        // 只有首次使用（还没有选中项）才允许自动选，其余交给「上次选中 + 重连窗口」。
         let ensureStart = try #require(modelSource.range(
             of: "private func ensureChromecastProfile() -> UUID {"
         ))
         let ensureRemainder = modelSource[ensureStart.upperBound...]
         let ensureEnd = try #require(ensureRemainder.range(
-            of: "private var hasConnectedXiaomiProfile"
+            of: "private func refreshChromecastActiveControlIDs"
         ))
-        #expect(ensureRemainder[..<ensureEnd.lowerBound].contains(
-            "RemoteDeviceNamePolicy.shouldAdoptConnectionSelection("
+        let ensureBody = ensureRemainder[..<ensureEnd.lowerBound]
+        #expect(ensureBody.contains("if settings.selectedRemoteProfile == nil {"))
+        #expect(!ensureBody.contains("RemoteDeviceNamePolicy.shouldAdoptConnectionSelection("))
+
+        let activateStart = try #require(modelSource.range(
+            of: "private func activateRemoteProfile(for bridge: XiaomiBluetoothBridge) -> UUID? {"
         ))
+        let activateRemainder = modelSource[activateStart.upperBound...]
+        let activateEnd = try #require(activateRemainder.range(
+            of: "/// Refresh display metadata without starting discovery"
+        ))
+        #expect(activateRemainder[..<activateEnd.lowerBound].contains(
+            "if settings.selectedRemoteProfile == nil {"
+        ))
+
+        // 进入按键页以「上次选中」为起点，留出重连窗口；窗口到期仍未连上才回退。
+        #expect(modelSource.contains("beginWaitingForPreviousRemote(trigger: \"mapping_page\")"))
+        #expect(modelSource.contains("reason=previous_remote_absent"))
+        #expect(modelSource.contains("RemoteDeviceNamePolicy.fallbackSelection("))
 
         // 用户手动点设备卡之后，连接事件不得把画布抢回小米。
         let settingsSource = try String(
@@ -264,7 +282,7 @@ struct SettingsPageRegressionTests {
         ))
     }
 
-    @Test func connectionPageKeepsCompatibilityAudioControlsWithoutExtraTools() throws {
+    @Test func connectionPageShowsCompatibilityAudioOnlyWhenMissing() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -275,9 +293,11 @@ struct SettingsPageRegressionTests {
         )
 
         #expect(settingsSource.contains("audio.action.refresh_devices"))
-        #expect(settingsSource.contains("audioCompatibilityPanel"))
-        #expect(settingsSource.contains("model.selectDoubaoAudioDevice()"))
+        #expect(settingsSource.contains("model.hasCompatibleVoiceOutputDevice"))
+        #expect(settingsSource.contains("audio.compatibility.missing_notice"))
         #expect(settingsSource.contains("model.openDoubaoDriverInstructions(using: localization)"))
+        #expect(!settingsSource.contains("audioCompatibilityPanel"))
+        #expect(!settingsSource.contains("model.selectDoubaoAudioDevice()"))
         #expect(!settingsSource.contains("audio.action.learn_virtual_microphones"))
         #expect(!settingsSource.contains("audio.action.send_test_tone"))
         #expect(!settingsSource.contains("model.testToneStatus.text(using: localization)"))
@@ -631,8 +651,11 @@ struct SettingsPageRegressionTests {
             range: phoneEntry.upperBound..<source.endIndex
         ))
         let phoneEntrySource = source[phoneEntry.lowerBound..<watchEntry.lowerBound]
-        #expect(phoneEntrySource.contains("phoneRemoteServer.start()"))
-        #expect(phoneEntrySource.contains("watchBluetoothServer.start()"))
+        #expect(phoneEntrySource.contains("isPhoneRemoteConnectionEnabled = true"))
+        #expect(phoneEntrySource.contains("updateNearbyRemoteLifecycle(reason: \"enabled_by_user\")"))
+        #expect(phoneEntrySource.contains("enabled: started && isPhoneRemoteConnectionEnabled"))
+        #expect(source.contains("self?.phoneRemoteServer.start()"))
+        #expect(source.contains("self?.watchBluetoothServer.start()"))
 
         let webEntry = try #require(source.range(
             of: "func enableWebRemoteConnection()",
@@ -647,7 +670,7 @@ struct SettingsPageRegressionTests {
         #expect(source.contains("func togglePhoneRemoteConnection()"))
         #expect(source.contains("localization.text(\"connection.phone.cancel_waiting\")"))
         #expect(source.contains("response == .alertThirdButtonReturn"))
-        #expect(source.contains("guard let self, self.isPhoneRemoteConnectionEnabled,"))
+        #expect(source.contains("self.nearbyRemoteLifecycle.acceptsEvents(generation: generation)"))
         #expect(source.contains("guard self.isPhoneRemoteConnectionEnabled else"))
         #expect(source.contains("phoneRemoteServer.onInvitationChange"))
         #expect(source.contains("@Published private(set) var phoneRemoteInvitation"))
@@ -789,7 +812,7 @@ struct SettingsPageRegressionTests {
 
         let saveButtonStart = try #require(source.range(of: "private var mappingSaveAsProfileButton"))
         let saveButtonEnd = try #require(source.range(
-            of: "private func mappingInheritanceControl",
+            of: "private func mappingMacroChoices",
             range: saveButtonStart.upperBound..<source.endIndex
         ))
         let saveButtonSource = source[saveButtonStart.lowerBound..<saveButtonEnd.lowerBound]
@@ -806,69 +829,14 @@ struct SettingsPageRegressionTests {
         #expect(rowButtonSource.contains(".fixedSize()"))
     }
 
-    /// 选中方案只是**浏览**：右侧出现「编辑」，编辑是会员功能，未解锁时整页只读。
-    @Test func mappingProfileEditingIsGatedByTheEditEntryAndMembership() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let source = try String(
-            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
-            encoding: .utf8
-        )
-
-        // 行内右端只放一个动作：基础映射是「保存」，选中方案后是「编辑 / 完成」。
-        let selectorStart = try #require(source.range(of: "private var mappingProfileSelector"))
-        let chipHelper = try #require(source.range(
-            of: "private func mappingProfileChip",
-            range: selectorStart.upperBound..<source.endIndex
-        ))
-        let rowSource = source[selectorStart.lowerBound..<chipHelper.lowerBound]
-        #expect(rowSource.contains("\"button_mapping.profile.edit\""))
-        #expect(rowSource.contains("\"button_mapping.profile.edit_done\""))
-        #expect(rowSource.contains("if isMappingProfileUnlocked"))
-        #expect(rowSource.contains("} else if selectedMappingProfileIsEditable {"))
-
-        // 会员判定必须复用按键方案页那套决策，不能自己发明一套规则；
-        // 而且要先过方案组件自己那份访问判定，否则测试构建里会出现「列表看得见、编辑被拦」的死按钮。
-        let gateStart = try #require(source.range(of: "private var canEditMappingProfiles"))
-        let gateSource = source[gateStart.lowerBound...].prefix(1400)
-        #expect(gateSource.contains("guard macroFeature.canUseMappingProfiles else { return false }"))
-        #expect(gateSource.contains("membershipFeature.buttonProfilesAccessDecision"))
-        #expect(gateSource.contains("case .allowed, .temporarilyOffline, .authorized:"))
-        #expect(gateSource.contains("case .requiresPlus, .unavailable:"))
-        // 会员模块整体不可用的构建里没有可点开通的入口，不能把人锁死。
-        #expect(gateSource.contains("guard membershipFeature.isFeatureVisible else { return true }"))
-
-        let integration = try String(
-            contentsOf: root.appendingPathComponent("Sources/RemoteMic/MacroFeatureIntegration.swift"),
-            encoding: .utf8
-        )
-        let accessStart = try #require(integration.range(of: "var canUseMappingProfiles: Bool"))
-        let accessSource = integration[accessStart.lowerBound...].prefix(600)
-        #expect(accessSource.contains("buttonProfilesFeature.buttonProfilesAccessDecision.permitsAccess"))
-
-        // 唯一的会员入口是私有模块的视图，仓库不得自绘第二个开通按钮。
-        let toolbarStart = try #require(source.range(of: "private var mappingProfileToolbar"))
-        let toolbarSource = source[toolbarStart.lowerBound..<gateStart.lowerBound]
-        #expect(toolbarSource.contains("membershipFeature.membershipRequiredView(forButtonProfiles: true)"))
-        #expect(toolbarSource.contains("showsProfileMembershipNotice"))
-
-        // 写入路径：编辑器禁用之外，保存函数自己也要拒绝只读预览。
-        #expect(source.contains("guard !isMappingProfilePreviewOnly else { return }"))
-        // 三处编辑器（动作、按住、单独的按住区）加页脚的「恢复默认」，一处都不能漏。
-        #expect(source.components(separatedBy: ".disabled(isMappingProfilePreviewOnly)").count - 1 == 4)
-        #expect(source.contains("private var isMappingProfilePreviewOnly: Bool"))
-
-        // 切换方案必须回到只读预览，不能让「刚解锁过」跟着带过去。
-        let selectStart = try #require(source.range(of: "private func selectMappingProfile("))
-        let selectEnd = try #require(source.range(
-            of: "private func openMappingProfileForEditing",
-            range: selectStart.upperBound..<source.endIndex
-        ))
-        let selectSource = source[selectStart.lowerBound..<selectEnd.lowerBound]
-        #expect(selectSource.contains("isEditingMappingProfile = false"))
-        #expect(selectSource.contains("showsProfileMembershipNotice = false"))
+    @Test func mappingSaveFailureCanRecoverCommittedValue() {
+        var reloads = 0
+        let result = ButtonMappingWriteRecovery.perform(write: { false }, reload: {
+            reloads += 1
+            return true
+        }, matches: { true })
+        #expect(result == .saved)
+        #expect(reloads == 1)
     }
 
     /// 私有「默认」方案就是基础映射：行内只能出现一项，不能同时显示「基础映射」和「默认」。
@@ -895,7 +863,137 @@ struct SettingsPageRegressionTests {
         #expect(!rowSource.contains("ForEach(macroFeature.mappingProfiles(device:"))
         // 组件无法区分可编辑性时回退到「基础映射 + 全部方案」，不能因此隐藏用户方案。
         #expect(rowSource.contains("baseMappingProfile(in: profiles)"))
-        #expect(source.contains("!macroFeature.isMappingProfileEditable($0.id)"))
+        #expect(source.contains("profiles.first(where: \\.isDefault)"))
+    }
+
+    @Test func mappingProfileListStaysVisibleWithoutAutosaveInterface() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        let integrationSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/MacroFeatureIntegration.swift"),
+            encoding: .utf8
+        )
+
+        let toolbarStart = try #require(source.range(of: "private var mappingProfileToolbar"))
+        let canEditStart = try #require(source.range(
+            of: "private var canEditMappingProfiles",
+            range: toolbarStart.upperBound..<source.endIndex
+        ))
+        let selectorStart = try #require(source.range(
+            of: "private var mappingProfileSelector",
+            range: canEditStart.upperBound..<source.endIndex
+        ))
+        let baseHelper = try #require(source.range(
+            of: "private func baseMappingProfile",
+            range: selectorStart.upperBound..<source.endIndex
+        ))
+        let toolbarSource = source[toolbarStart.lowerBound..<canEditStart.lowerBound]
+        let selectorSource = source[selectorStart.lowerBound..<baseHelper.lowerBound]
+
+        // 方案列表、创建/复制入口不能绑定到新版自动保存接口；旧构件只把内容降为只读。
+        #expect(!toolbarSource.contains("supportsMappingProfileAutosave"))
+        #expect(source.contains("if macroFeature.isButtonProfilesVisible { mappingProfileToolbar }"))
+        #expect(!selectorSource.contains("if macroFeature.supportsMappingProfileAutosave"))
+        #expect(selectorSource.contains("if macroFeature.isButtonProfilesVisible"))
+        #expect(selectorSource.contains("mappingSaveAsProfileButton"))
+        #expect(integrationSource.contains("buttonProfilesFeature.profiles(for: device)"))
+        #expect(integrationSource.contains("rawProfileBinding(device: device, profile: profile"))
+        #expect(integrationSource.contains("createLegacyMappingProfile"))
+        #expect(integrationSource.contains("legacyProfileHoldMode"))
+        // 钉住的组合动作版本过期时仍必须可编辑；只在宏已被删除时降为只读。
+        #expect(integrationSource.contains("editable = feature.savedMacroVersion(id: reference.macroID) != nil"))
+        #expect(integrationSource.contains("supportedProfileHoldModes"))
+    }
+
+    @Test func mappingProfileBindingStateAndClearEntryStayAvailable() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        // 继承/显式/不可用必须在编辑区可见，并且不可用覆盖可以单独清除。
+        #expect(source.contains("mappingProfileBindingControl(button: target.button, trigger: target.trigger)"))
+        #expect(source.contains("\"button_mapping.binding.inherited\""))
+        // 网格每键摘要显示实际动作，重复的“继承：”前缀只允许留在编辑区状态行。
+        #expect(!source.contains("button_mapping.binding.inherited_prefix"))
+        #expect(source.contains("\"button_mapping.binding.clear_override\""))
+        #expect(source.contains("private func clearMappingOverride(button: RemoteButton, trigger: ButtonTrigger)"))
+        #expect(source.contains("macroFeature.profileBindingMatches(nil, profile: profile"))
+        // 会员只读门禁不能因直接修改而丢失。
+        #expect(source.contains("return !macroFeature.supportsMappingProfileAutosave || !canEditMappingProfiles"))
+        #expect(source.contains("guard !isMappingProfilePreviewOnly else { return false }"))
+        #expect(source.contains("guard macroFeature.canUseMappingProfiles else { return false }"))
+        #expect(source.contains("membershipFeature.buttonProfilesAccessDecision"))
+        #expect(source.contains("mappingSaveAsProfileButton.disabled(!canEditMappingProfiles)"))
+        #expect(source.contains("if editingMappingProfileID != nil && membershipCanUnlock"))
+        // 方案里的按住只暴露组件能持久化的模式，并说明方向键按住属于默认方案。
+        #expect(source.contains("macroFeature.supportedProfileHoldModes"))
+        #expect(source.contains("button_mapping.hold.profile_repeat_only"))
+    }
+
+    @Test func nonMemberMappingHeaderUsesContextualMembershipCTA() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        let zh = try String(
+            contentsOf: root.appendingPathComponent("Resources/zh-Hans.lproj/Localizable.strings"),
+            encoding: .utf8
+        )
+        let en = try String(
+            contentsOf: root.appendingPathComponent("Resources/en.lproj/Localizable.strings"),
+            encoding: .utf8
+        )
+        let renderer = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsScreenshotRenderer.swift"),
+            encoding: .utf8
+        )
+
+        let gate = try #require(source.range(of: "private var showsMappingProfileMembershipCTA"))
+        let gateEnd = try #require(source.range(
+            of: "private func clearMappingSaveFeedback",
+            range: gate.upperBound..<source.endIndex
+        ))
+        let gateSource = source[gate.lowerBound..<gateEnd.lowerBound]
+        #expect(gateSource.contains("membershipFeature.isFeatureVisible"))
+        #expect(gateSource.contains("membershipFeature.buttonProfilesAccessDecision == .requiresPlus"))
+        #expect(gateSource.contains("!canEditMappingProfiles"))
+
+        let cta = try #require(source.range(of: "private var mappingProfileMembershipCTA"))
+        let ctaEnd = try #require(source.range(
+            of: "private func mappingMacroChoices",
+            range: cta.upperBound..<source.endIndex
+        ))
+        let ctaSource = source[cta.lowerBound..<ctaEnd.lowerBound]
+        #expect(ctaSource.contains("selectedSection = .membership"))
+        #expect(ctaSource.contains("MEMBERSHIP ENTRY source=mapping_profile_toolbar"))
+        #expect(ctaSource.contains("button_mapping.profile.membership.open"))
+
+        #expect(source.contains("if showsMappingProfileMembershipCTA {"))
+        #expect(source.contains("mappingSaveAsProfileButton.disabled(!canEditMappingProfiles)"))
+        #expect(source.contains("\"button_mapping.profile.membership.create_hint\""))
+        #expect(source.contains("\"button_mapping.profile.membership.copy_hint\""))
+        #expect(zh.contains("\"button_mapping.profile.membership.create_hint\" = \"开通后可创建新方案\";"))
+        #expect(zh.contains("\"button_mapping.profile.membership.copy_hint\" = \"开通后可复制当前方案\";"))
+        #expect(zh.contains("\"button_mapping.profile.membership.open\" = \"开通会员\";"))
+        #expect(en.contains("\"button_mapping.profile.membership.create_hint\" = \"Membership unlocks new profiles\";"))
+        #expect(en.contains("\"button_mapping.profile.membership.copy_hint\" = \"Membership unlocks profile copies\";"))
+        #expect(en.contains("\"button_mapping.profile.membership.open\" = \"Open membership\";"))
+        #expect(renderer.contains("REMOTE_MIC_SETTINGS_SCREENSHOT_MEMBERSHIP_ACCESS"))
+        #expect(renderer.contains("applyScreenshotState("))
     }
 
     @Test func remoteMappingScrollsResetWhenSwitchingProfilesAndConnectionPhotoFollowsModel() throws {
@@ -946,9 +1044,19 @@ struct SettingsPageRegressionTests {
 
         #expect(panelSource.contains("VStack(alignment: .leading, spacing: 12)"))
         #expect(!panelSource.contains("HStack(spacing: 16)"))
+        // 面板左上角标明是哪颗键，不再显示「按键功能已连接」这类连接状态。
+        #expect(!panelSource.contains("mappingHIDStatus"))
+        #expect(panelSource.contains("button_mapping.action_filter.voice_key"))
         #expect(panelSource.contains("mappingVoiceKeyModeControl"))
         #expect(!panelSource.contains("\"connection.voice_key_mode.unverified\""))
         #expect(panelSource.contains("connection.voice_key_mode.unverified_detail"))
+        // 非 Fn 触发键要目标工具配同一个键，SayAll 读不到对方设置；提示必须带可执行动作，
+        // 不能只是一行灰色说明，否则用户会当成介绍直接跳过。
+        #expect(panelSource.contains("NoticeInline("))
+        #expect(panelSource.contains("connection.voice_key_mode.mismatch.title"))
+        // 标题必须点名当前键名，不能用“配成同一个”这种看不出配哪个键的说法。
+        #expect(panelSource.contains("localization.text(settings.voiceKeyMode.localizationKey)"))
+        #expect(panelSource.contains("model.setVoiceKeyMode(.function)"))
         #expect(panelSource.contains("mappingVoiceFnTapControl"))
         #expect(!panelSource.contains("mappingVoiceShortTapFocusControl"))
         #expect(panelSource.contains("mappingRestoreDefaultsButton"))
@@ -1084,7 +1192,7 @@ struct SettingsPageRegressionTests {
         )
 
         let frameSize = try #require(appSource.range(
-            of: "private static let settingsWindowFrameSize = NSSize(width: 1067, height: 771)"
+            of: "private static let settingsWindowFrameSize = NSSize(width: 1067, height: 760)"
         ))
         let contentSize = try #require(appSource.range(
             of: "window.setContentSize(contentRect.size)"
@@ -1103,7 +1211,7 @@ struct SettingsPageRegressionTests {
         #expect(autosave.upperBound <= center.lowerBound)
     }
 
-    @Test func settingsWindowHonorsDockPreferenceAndKeepsStandardWindowActions() throws {
+    @Test func settingsWindowKeepsStandardWindowActionsAndAppliesDockPreference() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1115,57 +1223,55 @@ struct SettingsPageRegressionTests {
 
         #expect(appSource.contains("window.hidesOnDeactivate = false"))
         #expect(appSource.contains("window.delegate = self"))
-        #expect(appSource.contains("SettingsWindowActivationPolicy.value("))
+        #expect(appSource.contains("delegate.updateDockActivationPolicy(source: \"launch\")"))
+        #expect(appSource.contains("isSettingsWindowOpen = true\n        updateDockActivationPolicy(source: \"window_open\")"))
+        #expect(appSource.contains("isSettingsWindowOpen = false\n        updateDockActivationPolicy(source: \"window_close\")"))
+        #expect(appSource.contains("model.settings.showDockIcon = isVisible\n        updateDockActivationPolicy(source: \"dock_toggle\")"))
+        #expect(appSource.contains("updateDockActivationPolicy(source: \"configuration_import\")"))
         #expect(appSource.contains("func windowWillClose(_ notification: Notification)"))
         #expect(appSource.contains("func windowDidMiniaturize(_ notification: Notification)"))
         #expect(appSource.contains("func windowDidDeminiaturize(_ notification: Notification)"))
         #expect(appSource.contains("source: \"window_miniaturized\""))
         #expect(appSource.contains("source: \"window_deminiaturized\""))
-        #expect(appSource.contains("source: \"activation_policy\""))
-        #expect(appSource.contains("isSettingsWindowOpen = false"))
+        #expect(appSource.contains("#selector(showSettingsFromStatusMenu)"))
         #expect(!appSource.contains("window.canHide = false"))
         #expect(appSource.contains("NSApp.keyWindow?.performClose(nil)"))
         #expect(appSource.contains("performMiniaturize:"))
         #expect(appSource.contains("hideOtherApplications:"))
         #expect(appSource.contains("unhideAllApplications:"))
         #expect(appSource.contains("NSApp.windowsMenu = windowMenu"))
-
-        #expect(SettingsWindowActivationPolicy.value(
-            showDockIcon: false,
-            isSettingsWindowOpen: true
-        ) == .accessory)
-        #expect(SettingsWindowActivationPolicy.value(
-            showDockIcon: false,
-            isSettingsWindowOpen: false
-        ) == .accessory)
-        #expect(SettingsWindowActivationPolicy.value(
-            showDockIcon: true,
-            isSettingsWindowOpen: false
-        ) == .regular)
     }
 
-    @Test func hiddenDockAndMenuBarKeepAnExplicitLaunchRecoveryPath() throws {
+    @Test(arguments: [false, true], [false, true])
+    func dockPolicyHonorsPreferenceAndAnOpenSettingsWindow(
+        showDockIcon: Bool,
+        isSettingsWindowOpen: Bool
+    ) {
+        let policy = SettingsWindowActivationPolicy.value(
+            showDockIcon: showDockIcon,
+            isSettingsWindowOpen: isSettingsWindowOpen
+        )
+        #expect(policy == (!showDockIcon && !isSettingsWindowOpen ? .accessory : .regular))
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func startupOpensSettingsIfBothEntryPointsAreDisabled(
+        showDockIcon: Bool,
+        showStatusBarIcon: Bool
+    ) {
+        #expect(AppEntryPointVisibilityPolicy.shouldShowMainWindow(
+            baseLaunchDecision: false,
+            showDockIcon: showDockIcon,
+            showStatusBarIcon: showStatusBarIcon
+        ) == (!showDockIcon && !showStatusBarIcon))
         #expect(AppEntryPointVisibilityPolicy.shouldShowMainWindow(
             baseLaunchDecision: true,
-            showDockIcon: true,
-            showStatusBarIcon: true
+            showDockIcon: showDockIcon,
+            showStatusBarIcon: showStatusBarIcon
         ))
-        #expect(AppEntryPointVisibilityPolicy.shouldShowMainWindow(
-            baseLaunchDecision: false,
-            showDockIcon: false,
-            showStatusBarIcon: false
-        ))
-        #expect(!AppEntryPointVisibilityPolicy.shouldShowMainWindow(
-            baseLaunchDecision: false,
-            showDockIcon: true,
-            showStatusBarIcon: false
-        ))
-        #expect(!AppEntryPointVisibilityPolicy.shouldShowMainWindow(
-            baseLaunchDecision: false,
-            showDockIcon: false,
-            showStatusBarIcon: true
-        ))
+    }
 
+    @Test func menuBarVisibilityKeepsTheSystemReopenPath() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1206,16 +1312,20 @@ struct SettingsPageRegressionTests {
             encoding: .utf8
         )
 
-        #expect(settingsSource.contains("action.system_volume_up_short"))
-        #expect(settingsSource.contains("action.system_volume_down_short"))
-        #expect(chinese.contains(#""action.system_volume_up_short" = "Vol+""#))
-        #expect(chinese.contains(#""action.system_volume_down_short" = "Vol-""#))
-        #expect(chinese.contains("上一首（系统媒体）"))
-        #expect(chinese.contains("下一首（系统媒体）"))
-        #expect(chinese.contains(#""action.show_desktop" = "显示桌面（fn + F11）""#))
-        #expect(english.contains("Previous Track (System Media)"))
-        #expect(english.contains("Next Track (System Media)"))
-        #expect(english.contains(#""action.show_desktop" = "Show Desktop (fn + F11)""#))
+        // 按键页、方案页、手机端共用同一套动作语义名：
+        // 不再有 Vol+ / Vol- 短标签，音量、方向与内置按键动作统一读语义名表。
+        #expect(!settingsSource.contains("action.system_volume_up_short"))
+        #expect(!settingsSource.contains("action.system_volume_down_short"))
+        #expect(chinese.contains(#""action.system_volume_up" = "增大音量""#))
+        #expect(chinese.contains(#""action.system_volume_down" = "减小音量""#))
+        #expect(chinese.contains(#""action.previous_command_left" = "上一首""#))
+        #expect(chinese.contains(#""action.next_command_right" = "下一首""#))
+        #expect(chinese.contains(#""action.show_desktop" = "显示桌面""#))
+        #expect(chinese.contains(#""action.arrow_up" = "↑""#))
+        #expect(english.contains(#""action.previous_command_left" = "Previous Track""#))
+        #expect(english.contains(#""action.next_command_right" = "Next Track""#))
+        #expect(english.contains(#""action.show_desktop" = "Show Desktop""#))
+        #expect(remoteButtonsSource.contains(#"case .appSwitcher: return localization.text("action.app_switcher")"#))
         #expect(remoteButtonsSource.contains("if self == .showDesktop"))
     }
 
@@ -1466,10 +1576,32 @@ struct SettingsPageRegressionTests {
         #expect(source.contains("connection.voice_fn_tap.hint_short"))
         #expect(source.contains("ButtonActionCategory.allCases"))
         #expect(source.contains("MappingActionFilter.visibleCases"))
-        #expect(source.contains("[.basicKeys, .systemAndMedia, .custom, .commonPhrases, .applications]"))
+        // 自定义按键紧接基础按键，按键速度排在最后。
+        #expect(source.contains("[.all, .basicKeys, .customShortcuts, .systemAndMedia, .custom]"))
+        #expect(source.contains("cases.append(.combinations)"))
+        #expect(source.contains("mappingActionFilter = .customShortcuts"))
+        #expect(source.contains("if category == .customShortcuts,"))
+        #expect(source.contains("Button(\"button_mapping.action_filter.custom_shortcuts\")"))
+        #expect(source.contains("source=basic_keys_header"))
+        #expect(source.contains("result=editor_presented"))
+        #expect(source.contains("configured: configured\n                        )\n                        .disabled(isManagedPowerAction)"))
+        // 顺序：打开 App → 按住 → 按键速度。
+        #expect(source.contains("[.commonPhrases, .applications, .hold, .buttonSpeed]"))
+        #expect(source.contains("case .hold, .buttonSpeed:"))
+        #expect(source.contains("mappingActionFilter == .hold"))
+        #expect(source.contains("mapping-hold-tab"))
+        // 点按键只打开动作编辑器，不能顺带把「按住」面板带出来。
+        #expect(source.contains(
+            "mappingHoldEditingButton = nil\n                    mappingEditingTarget = ShortcutEditingTarget("
+        ))
+        // 点按键时落在它已配置动作所属的胶囊；未配置才回落到「全部」。
+        #expect(source.contains("mappingFilterForConfiguredAction("))
+        #expect(source.contains("guard action != .disabled else { return .all }"))
+        // 打开编辑器滚到胶囊而不是面板顶部，否则胶囊会被顶出视口。
+        #expect(source.contains("proxy.scrollTo(\"mapping-action-filter\", anchor: .top)"))
         #expect(source.contains("mappingActionFilterControl"))
         #expect(source.contains("customApplicationTargetPicker("))
-        // 聚焦方式与滚动区域已迁到独立的「APP 适配」页，按键编辑区只留只读状态与跳转。
+        // 聚焦方式与滚动区域已迁到独立的「聚焦与翻页」页面，按键编辑区只留只读状态与跳转。
         #expect(source.contains("applicationsPage"))
         #expect(source.contains("custom_application.go_configure"))
         #expect(source.contains("applicationBindingSection"))
@@ -1478,6 +1610,7 @@ struct SettingsPageRegressionTests {
         #expect(source.contains("custom_application.remove_blocked"))
         #expect(source.contains("custom_application.remove_confirm_title"))
         #expect(source.contains("settings.section.applications"))
+        #expect(source.contains("settings.section.applications.sidebar"))
         #expect(!source.contains("applicationFocusEditor("))
         #expect(!source.contains("applicationFocusProfileID"))
         #expect(source.contains("custom_application.focus.scope_note"))
@@ -1488,6 +1621,37 @@ struct SettingsPageRegressionTests {
         #expect(source.contains("ButtonActionCategory.allCases.filter(mappingActionFilter.includes)"))
         #expect(source.contains("category == .commonPhrases"))
         #expect(source.contains("category == .applications"))
+        // 组合动作是和「常用语」并列的独立分类：按自己的分类位置渲染，
+        // 不再寄生在「自定义动作」分组下面，也不再受该分组的筛选条件控制。
+        #expect(source.contains("if category == .combinations {"))
+        #expect(!source.contains("if mappingActionFilter.includes(.custom), macroFeature.isFeatureVisible"))
+        #expect(source.contains("mappingActionFilter = .combinations"))
+        // 「输入框」分类只有一个动作：提示语放在它右侧，指向真正配置学习入口的页面。
+        // 「按住」「按键速度」是整块面板，只在「全部」或选中自己那颗胶囊时渲染；
+        // 选中它们时动作编辑面板整块隐藏，避免两层边框和两个标题。
+        #expect(source.contains("mappingActionFilter == .hold"))
+        #expect(source.contains("mappingActionFilter == .buttonSpeed"))
+        #expect(source.contains("mapping-hold-tab"))
+        #expect(source.contains("mapping-button-speed-tab"))
+        #expect(source.contains("mappingActionFilter != .hold"))
+        #expect(source.contains("mappingActionFilter != .buttonSpeed"))
+        // 语音键不再是胶囊：它只在点击画布上的语音键卡片时出现。
+        #expect(!source.contains("case .voiceKey"))
+        // 标题图标与按键名按视觉居中成组；不同 SF Symbol 字形高度不同，
+        // 用固定基线偏移会让菜单键、上下键看起来忽高忽低。
+        #expect(!source.contains("alignmentGuide(.firstTextBaseline)"))
+        // 横向滚动容器内容左右各留 2pt，避免 ScrollView 裁掉首个元素的描边和圆角。
+        // 目前有四处：方案 chip、组合动作卡片、遥控器卡片、分类胶囊。
+        #expect(source.components(separatedBy: ".padding(.horizontal, 2)").count - 1 >= 4)
+        // 每次点按键都发滚动请求：重复点同一颗键时不能只依赖 onChange。
+        #expect(source.contains("mappingFilterScrollRequest &+= 1"))
+        #expect(source.contains("inputFocusActionControls("))
+        #expect(source.contains("button_mapping.focus_input.app_adaptation_hint.prefix"))
+        // 提示语里的「聚焦与翻页」页面入口是可点跳转的按钮，不是死文字。
+        #expect(source.contains("focus-input-app-adaptation-link"))
+        // 「目标 APP」选择器属于「打开 App」分类，切到其他胶囊后必须一起隐藏，
+        // 不能只凭当前动作是「打开自定义 APP」就常驻。
+        #expect(source.contains("mappingActionFilter.includes(.applications)"))
         #expect(source.contains("button_mapping.action_filter.all"))
         #expect(source.contains("macroFeature.configurationTransferView("))
         #expect(!source.contains("settings.portable_configuration.title"))
@@ -1496,6 +1660,15 @@ struct SettingsPageRegressionTests {
         #expect(source.contains(".accessibilityAddTraits(isSelected ? .isSelected : [])"))
         #expect(source.contains("LazyVGrid("))
         #expect(source.contains("button_mapping.action.disable_switch"))
+        // 动作编辑面板保留停用开关，但不再提供「关闭」按钮。
+        let editorPanelStart = try #require(settingsSource.range(of: "private func mappingEditorPanel"))
+        let editorPanelEnd = try #require(settingsSource.range(
+            of: "private func mappingVoiceSettingsPanel",
+            range: editorPanelStart.upperBound..<settingsSource.endIndex
+        ))
+        let editorPanelSource = settingsSource[editorPanelStart.lowerBound..<editorPanelEnd.lowerBound]
+        #expect(editorPanelSource.contains("button_mapping.action.disable_switch"))
+        #expect(!editorPanelSource.contains("Button(\"common.action.close\")"))
         #expect(source.contains(").filter { $0 != .disabled && $0 != .combinationAction }"))
         #expect(!source.contains("DisclosureGroup(isExpanded: $isPresetApplicationActionsExpanded)"))
         #expect(!source.contains("isPresetApplicationActionsExpanded"))
@@ -1514,7 +1687,7 @@ struct SettingsPageRegressionTests {
         #expect(source.contains(".pickerStyle(.segmented)"))
         #expect(source.contains(".tint(Color.accentColor)"))
         #expect(source.contains("requiresSiriRemoteMembership(for: profile)"))
-        #expect(source.contains("siri_remote.activation.open_membership"))
+        #expect(source.contains("remote.card.open_membership"))
         #expect(source.contains("selectedSection = .membership"))
         #expect(source.contains("membershipFeature.refreshIfNeeded()"))
         #expect(!source.contains("siri_remote.activation.disable"))
@@ -1524,7 +1697,8 @@ struct SettingsPageRegressionTests {
         #expect(!mappingCanvasSource.contains("size: 10"))
         #expect(!mappingCanvasSource.contains("size: 11"))
         #expect(!mappingCanvasSource.contains("minimumScaleFactor"))
-        #expect(source.range(of: "MappingRemotePhoto()")!.lowerBound < source.range(of: "connectionLines(metrics: metrics)")!.lowerBound)
+        #expect(source.contains("remoteModel: settings.selectedRemoteProfile?.model"))
+        #expect(source.range(of: "MappingRemotePhoto(model: remoteModel)")!.lowerBound < source.range(of: "connectionLines(metrics: metrics)")!.lowerBound)
 
         let voiceFnToggle = "Toggle(\"connection.voice_fn_tap.enabled\""
         #expect(source.components(separatedBy: voiceFnToggle).count == 2)
@@ -1562,15 +1736,36 @@ struct SettingsPageRegressionTests {
         #expect(canvas.contains("let cardHeight: CGFloat = 72"))
         #expect(settings.contains("mappingHoldEditorPanel(button)"))
         #expect(settings.contains("RemoteButtonHoldMode.selectableCases"))
-        #expect(settings.contains(".disabled(profileUnsupported || !blockers.isEmpty)"))
-        #expect(settings.contains("reconcileMappingHoldMode(afterChanging: button)"))
+        #expect(settings.contains(".disabled(profileUnsupported || !canWriteMappingHold(button) || !blockers.isEmpty)"))
+        #expect(settings.contains("reconcileMappingHoldMode(afterChanging: button, operationID: operationID)"))
         #expect(settings.contains("guard let mode = RemoteButtonHoldModeDefault.storedMode"))
         #expect(!settings.contains("resolvedMode == .repeatSingle, repeatSingle.unavailableReason != nil"))
         #expect(!settings.contains("mappingInteractionControl"))
         #expect(!settings.contains("holdSingle"))
         #expect(renderer.contains("REMOTE_MIC_SETTINGS_SCREENSHOT_OPEN_HOLD_EDITOR"))
         #expect(renderer.contains("REMOTE_MIC_SETTINGS_SCREENSHOT_HOLD_MODE"))
-        #expect(chinese.contains("\"button_mapping.hold.repeat_prefix\" = \"按住：重复 \""))
+        #expect(renderer.contains("REMOTE_MIC_SETTINGS_SCREENSHOT_REMOTE_MODEL"))
+        #expect(chinese.contains("\"button_mapping.hold.repeat_prefix\" = \"按住时 重复单击动作 \""))
+        #expect(chinese.contains("相当于按住键盘上的 %@，直到松手。"))
+        #expect(chinese.contains("重复执行单击动作"))
+        #expect(chinese.contains("重复执行长按动作"))
+        #expect(settings.contains("blockers.map(holdBlockerText)"))
+        #expect(chinese.contains("长按已设置为「%@」。要启用“重复执行单击动作”"))
+        #expect(chinese.contains("或改选“重复执行长按动作”"))
+        #expect(settings.contains("snapshot.allowsKeyHold = button.allowsKeyHold"))
+        let panelStart = try #require(settings.range(of: "private func mappingHoldEditorPanel("))
+        let modesStart = try #require(settings.range(of: "private func availableHoldModes("))
+        let titleStart = try #require(settings.range(of: "private func mappingHoldOptionTitle("))
+        let columnStart = try #require(settings.range(of: "private func mappingHoldOptionColumn("))
+        let timingStart = try #require(settings.range(of: "private var mappingGestureTimingSection:"))
+        let panel = settings[panelStart.lowerBound..<modesStart.lowerBound]
+        #expect(!panel.contains("button_mapping.hold.current_setting"))
+        #expect(!panel.contains("button_mapping.hold.timing_help"))
+        let modes = settings[modesStart.lowerBound..<titleStart.lowerBound]
+        #expect(modes.contains("snapshot.allowsKeyHold"))
+        #expect(!modes.contains("blockers(for:"))
+        let column = settings[columnStart.lowerBound..<timingStart.lowerBound]
+        #expect(column.contains("button_mapping.hold.timing_help"))
         #expect(!settings.contains("button_mapping.hold.paused_tag"))
     }
 
@@ -1660,39 +1855,24 @@ struct SettingsPageRegressionTests {
         #expect(chinese.contains(#""remote.device.model.rc003" = "小米蓝牙遥控器 2 Pro";"#))
         #expect(english.contains(#""remote.device.model.rc001" = "Xiaomi Bluetooth Remote 2";"#))
         #expect(english.contains(#""remote.device.model.rc003" = "Xiaomi Bluetooth Remote 2 Pro";"#))
-        #expect(chinese.contains(#""remote.device.model.apple_siri_remote_a2854" = "苹果遥控器第 7 代";"#))
-        #expect(chinese.contains(#""remote.device.model.apple_siri_remote_a2540" = "苹果遥控器第 6 代";"#))
+        #expect(chinese.contains(#""remote.device.model.apple_siri_remote_a2854" = "苹果遥控器 Type-C";"#))
+        #expect(chinese.contains(#""remote.device.model.apple_siri_remote_a2540" = "苹果遥控器 Lightning";"#))
 
-        let cardStart = try #require(settingsSource.range(of: "private func remoteDeviceCard"))
-        let cardEnd = try #require(settingsSource.range(
-            of: "private func batterySymbol",
-            range: cardStart.upperBound..<settingsSource.endIndex
-        ))
-        let cardSource = settingsSource[cardStart.lowerBound..<cardEnd.lowerBound]
-        #expect(cardSource.contains("return HStack(alignment: .center, spacing: 10)"))
-        #expect(cardSource.contains("fillsWidth ? nil : 232"))
-        #expect(cardSource.contains("let modelName = remoteModelName(profile)"))
-        #expect(cardSource.contains("let systemName = remoteSystemName(profile)"))
-        #expect(cardSource.contains("Text(modelName)"))
-        #expect(cardSource.contains("Text(systemName)"))
-        #expect(cardSource.contains(".accessibilityLabel(Text(\"\\(modelName), \\(systemName)\"))"))
-        #expect(cardSource.contains("remoteBatteryLabel("))
-        #expect(cardSource.contains("let powerState = model.powerState(for: profile.id)"))
-        #expect(cardSource.contains("if showsBattery"))
-        #expect(cardSource.contains("Image(systemName: \"bolt.fill\")"))
-        #expect(!cardSource.contains("Label(power.text"))
-        #expect(!cardSource.contains("remote.device.power.rechargeable"))
-        for symbol in [
-            "battery.0percent",
-            "battery.25percent",
-            "battery.50percent",
-            "battery.75percent",
-            "battery.100percent",
-        ] {
-            #expect(settingsSource.contains(symbol))
+        let shared = try String(contentsOf: root.appendingPathComponent("Sources/RemoteMic/RemoteDeviceCard.swift"), encoding: .utf8)
+        #expect(settingsSource.contains("return RemoteDeviceCard("))
+        #expect(settingsSource.contains("remoteDeviceCard(profile, history: true)"))
+        #expect(shared.contains("Text(modelName)"))
+        #expect(shared.contains("Text(systemName)"))
+        #expect(shared.contains("Image(systemName: \"bolt.fill\")"))
+        #expect(shared.contains("SettingsPageBehavior.mappingRemoteCardHeight"))
+        #expect(shared.contains("SettingsPageBehavior.mappingRemoteCardWidth"))
+        // The whole card must route to device selection; a background-only gesture
+        // leaves the text rows as dead zones. Text and battery carry their own gestures
+        // because macOS Text views consume the click before the background.
+        #expect(shared.components(separatedBy: ".onTapGesture(perform: onSelect)").count - 1 >= 6)
+        for symbol in ["battery.0percent", "battery.25percent", "battery.50percent", "battery.75percent", "battery.100percent"] {
+            #expect(shared.contains(symbol))
         }
-        #expect(settingsSource.contains("if level <= 10 { return .red }"))
-        #expect(settingsSource.contains("if level <= 25 { return .orange }"))
 
         let panelStart = try #require(settingsSource.range(of: "private var connectionDevicePanel"))
         let panelEnd = try #require(settingsSource.range(
@@ -1759,7 +1939,8 @@ struct SettingsPageRegressionTests {
         let selectorSource = source[selectorStart.lowerBound..<selectorEnd.lowerBound]
 
         #expect(selectorSource.contains("model.isRemoteConnected(profile.id)"))
-        #expect(selectorSource.contains("model.isRemoteConnected(profile.id) || profile.model.isAppleSiriRemote"))
+        #expect(selectorSource.contains("(!vertical && profile.model.usesPrivateAdapter)"))
+        #expect(selectorSource.contains("profile.model.isAppleSiriRemote") == false)
         #expect(selectorSource.contains("RemoteDeviceNamePolicy.sortedForCards("))
         #expect(selectorSource.contains("modelName: remoteModelName"))
         #expect(selectorSource.contains("systemName: { model.systemDeviceName(for: $0) }"))
@@ -1774,6 +1955,42 @@ struct SettingsPageRegressionTests {
         #expect(!selectorSource.contains("ForEach(settings.remoteDeviceProfiles)"))
         #expect(source.contains("Button(\"connection.action.reconnect\")"))
         #expect(source.contains("remote.device.system_name_unknown"))
+    }
+
+    /// 按键页空状态与已连接设备卡共用页头 HStack 的底边。
+    /// 空状态一旦比设备卡高或宽，遥控器连上的瞬间就会把分隔线和整页内容顶上去。
+    @Test func mappingEmptyRemoteStateMatchesRemoteCardSize() throws {
+        #expect(SettingsPageBehavior.mappingRemoteCardWidth == 232)
+        #expect(SettingsPageBehavior.mappingRemoteCardHeight == 72)
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+
+        let emptyStart = try #require(source.range(of: "private func remoteDeviceEmptyState"))
+        let emptyEnd = try #require(source.range(
+            of: "private func remoteDeviceCard",
+            range: emptyStart.upperBound..<source.endIndex
+        ))
+        let emptySource = source[emptyStart.lowerBound..<emptyEnd.lowerBound]
+        let horizontalStart = try #require(emptySource.range(of: "} else {"))
+        let horizontalSource = emptySource[horizontalStart.upperBound...]
+
+        #expect(emptySource.contains("if vertical"))
+        #expect(emptySource.contains("VStack(alignment: .leading, spacing: 8)"))
+        #expect(horizontalSource.contains("VStack(alignment: .leading, spacing: 4)"))
+        #expect(horizontalSource.contains("width: SettingsPageBehavior.mappingRemoteCardWidth"))
+        #expect(horizontalSource.contains("height: SettingsPageBehavior.mappingRemoteCardHeight"))
+        #expect(horizontalSource.contains(".lineLimit(2)"))
+        #expect(horizontalSource.contains(".fixedSize(horizontal: false, vertical: true)"))
+        #expect(horizontalSource.contains(".layoutPriority(1)"))
+        #expect(horizontalSource.contains("Button(\"connection.action.reconnect\")"))
+        #expect(source.contains("return RemoteDeviceCard("))
     }
 
     @Test func settingsPageKeepsVersionFeaturesTogetherAndLanguagesVisible() throws {
@@ -1808,6 +2025,9 @@ struct SettingsPageRegressionTests {
         let languageSection = settingsPage[languageSectionStart.lowerBound..<languageSectionEnd.lowerBound]
         #expect(languageSection.contains(".frame(width: 300)"))
         #expect(languageSection.contains(".frame(maxWidth: .infinity, alignment: .leading)"))
+        let languageRowIcon = settingsPage[..<languageSectionStart.lowerBound].suffix(200)
+        #expect(languageRowIcon.contains(".foregroundStyle(Color.accentColor)"))
+        #expect(!languageRowIcon.contains(".foregroundStyle(.green)"))
         #expect(!settingsPage.contains("help.glossary.open"))
         #expect(!settingsPage.contains("openGlossary"))
 
@@ -1819,6 +2039,27 @@ struct SettingsPageRegressionTests {
         #expect(appSource.contains("userDriverDelegate: self"))
         #expect(appSource.contains("standardUserDriverShouldShowVersionHistory(for item: SUAppcastItem) -> Bool"))
         #expect(appSource.contains("semantic_newer_but_sparkle_rejected"))
+    }
+
+    @Test func statisticsVoiceSessionRankingUsesAccentColorForDecorativeHighlight() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        let panelStart = try #require(source.range(of: "private var statisticsVoiceSessionRankingPanel"))
+        let panelEnd = try #require(
+            source.range(
+                of: "private var transcriptHistoryPage",
+                range: panelStart.upperBound..<source.endIndex
+            )
+        )
+        let panel = source[panelStart.lowerBound..<panelEnd.lowerBound]
+        #expect(!panel.contains(".foregroundStyle(.orange)"))
+        #expect(panel.contains(".foregroundStyle(Color.accentColor)"))
     }
 
     @Test func settingsPageUsesAnInlineAppIconPickerWithoutUnavailablePlaceholders() throws {
@@ -1988,7 +2229,9 @@ struct SettingsPageRegressionTests {
         #expect(settings.contains("macroFeature.enrollmentView"))
         #expect(settings.contains("macroFeature.setEditorActive(false)"))
         #expect(settings.contains("if section != .macros"))
-        #expect(model.contains("!self.macroFeature.isEditorActive && !suppressConfiguredAction"))
+        #expect(model.contains("!self.macroFeature.isEditorActive &&"))
+        #expect(model.contains("!suppressConfiguredAction &&"))
+        #expect(model.contains("!holdConfiguredActionForPendingIdentity"))
         #expect(model.contains("if macroFeature.isEditorActive"))
         #expect(chinese.contains("输入框"))
         #expect(chinese.contains("MCP / TOML"))
@@ -2062,7 +2305,7 @@ struct SettingsPageRegressionTests {
         )
 
         #expect(source.contains(
-            "accountDisplayName: membershipFeature.accountDisplayName"
+            "accountDisplayName: sidebarAccountDisplayName ?? membershipFeature.accountDisplayName"
         ))
         #expect(integration.contains("@Published private(set) var accountDisplayName: String?"))
         #expect(integration.contains("adapter.$accountDisplayName"))
@@ -2157,6 +2400,7 @@ struct SettingsPageRegressionTests {
             "model.macroFeature.updateLocaleIdentifier(localization.locale.identifier)"
         ))
         #expect(source.contains("REMOTE_MIC_SETTINGS_SCREENSHOT_OPEN_ACTION_EDITOR"))
+        #expect(source.contains("REMOTE_MIC_SETTINGS_SCREENSHOT_ACTION_BUTTON"))
         #expect(source.contains(
             "model.membershipFeature.updateLocaleIdentifier(localization.locale.identifier)"
         ))
@@ -2244,10 +2488,18 @@ struct SettingsPageRegressionTests {
         #expect(historySource.contains("private var expandedDayKeys: Set<String> = []"))
         #expect(!historySource.contains("ForEach(recordingDayGroups)"))
         #expect(historySource.contains("recordingAssetsBySessionID"))
-        #expect(historySource.contains("statistics.transcripts.view_more_by_application"))
+        #expect(historySource.contains("statistics.transcripts.expand_applications"))
+        #expect(!historySource.contains("statistics.transcripts.view_more_by_application"))
+        #expect(!historySource.contains("hasEarlierEntries"))
         #expect(historySource.contains("static let recentWindow: TimeInterval"))
         #expect(historySource.contains("private func toggleDay(_ dayKey: String)"))
-        #expect(historySource.contains("dayGroupView(group)"))
+        #expect(historySource.contains("LazyVStack(alignment: .leading, spacing: 0)"))
+        #expect(historySource.contains(
+            "TranscriptHistoryPresentationPolicy.timelineItems("
+        ))
+        #expect(historySource.contains("ForEach(Array(items.enumerated()), id: \\.element.id)"))
+        #expect(historySource.contains("timelineEntryView(entry, isLast: isLast)"))
+        #expect(!historySource.contains("dayGroupView(group)"))
         #expect(!historySource.contains(".frame(width: 250, alignment: .topLeading)"))
         #expect(historySource.contains("private var deleteAllRow"))
         let agentAccessPosition = try #require(
@@ -2276,8 +2528,10 @@ struct SettingsPageRegressionTests {
         #expect(historySource.contains("reason = \"date_groups_collapsed\""))
         #expect(historySource.contains("displayed_count=\\(displayedCount)"))
         #expect(agentAccessSource.contains("statistics.transcripts.agent_access.enable"))
-        #expect(agentAccessSource.contains("model.copyStandardConfiguration()"))
-        #expect(agentAccessSource.contains("model.copyCodexConfiguration()"))
+        #expect(agentAccessSource.contains("model.copyInstallPrompt("))
+        #expect(agentAccessSource.contains("statistics.transcripts.agent_access.install_prompt_preview"))
+        #expect(!agentAccessSource.contains("statistics.transcripts.agent_access.copy_standard"))
+        #expect(!agentAccessSource.contains("statistics.transcripts.agent_access.copy_codex"))
         #expect(agentAccessSource.contains("model.revoke(authorization)"))
         #expect(agentAccessSource.contains("ForEach(MCPClientKind.allCases)"))
         #expect(agentAccessSource.contains("LazyVGrid("))
@@ -2308,6 +2562,12 @@ struct SettingsPageRegressionTests {
         #expect(modelSource.contains("recordingPlaybackAssetID"))
         #expect(modelSource.contains("isRecordingPlaybackPlaying"))
         #expect(modelSource.contains("audioPlayerDidFinishPlaying"))
+        let refreshStart = try #require(modelSource.range(of: "func refreshTranscriptRecords()"))
+        let refreshEnd = try #require(modelSource.range(of: "func playRecording("))
+        let refreshBody = modelSource[refreshStart.lowerBound..<refreshEnd.lowerBound]
+        #expect(refreshBody.contains("self.transcriptRecords != records"))
+        #expect(refreshBody.contains("self.recordingAssets != assets"))
+        #expect(!refreshBody.contains("recordingToggleCancellable ="))
         #expect(!captureSource.contains("PrivateFeatureIntegration"))
         #expect(!captureSource.contains("API"))
     }
@@ -2346,7 +2606,7 @@ struct SettingsPageRegressionTests {
         let reference = try #require(calendar.date(from: DateComponents(year: 2026, month: 10, day: 10)))
         let today = try #require(calendar.date(byAdding: .day, value: offset, to: reference))
         let suite = "RemoteMicTests.Calendar.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.recordButtonPress(at: today, calendar: calendar)
@@ -2404,7 +2664,7 @@ struct SettingsPageRegressionTests {
                 byteCount: 0, sha256: "", format: "m4a")
         }
         let suite = "RemoteMicTests.CalendarCounts.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         let assets = [asset(sessionID: record.sessionID), asset(sessionID: UUID())]
@@ -2601,5 +2861,43 @@ struct SettingsPageRegressionTests {
         #expect(!source.contains("button_mapping.return_choose_macro"))
         #expect(source.contains("onBindToButton: {"))
         #expect(source.contains("mappingEditingTarget = nil"))
+    }
+
+    @MainActor @Test func screenshotDemoUpdateStaysNewerThanTheHostApp() {
+        let candidate = SettingsScreenshotRenderer.demoUpdateCandidate(
+            currentVersion: "2.0.2",
+            currentBuild: "320"
+        )
+        #expect(candidate.displayVersion == "2.0.3")
+        #expect(candidate.buildVersion == "321")
+        #expect(UpdateVersion.isNewer(candidate.displayVersion, than: "2.0.2"))
+    }
+
+    @MainActor @Test func screenshotDemoUpdateBumpsTheLastVersionComponentAndBuild() {
+        let twoPart = SettingsScreenshotRenderer.demoUpdateCandidate(
+            currentVersion: "2.0",
+            currentBuild: "5"
+        )
+        #expect(twoPart.displayVersion == "2.1")
+        #expect(twoPart.buildVersion == "6")
+
+        let fourPart = SettingsScreenshotRenderer.demoUpdateCandidate(
+            currentVersion: "2.0.1.4",
+            currentBuild: "999"
+        )
+        #expect(fourPart.displayVersion == "2.0.1.5")
+        #expect(fourPart.buildVersion == "1000")
+        #expect(UpdateVersion.isNewer(fourPart.displayVersion, than: "2.0.1.4"))
+    }
+
+    @MainActor @Test func screenshotDemoUpdateFallsBackWhenBundleMetadataIsMissing() {
+        let candidate = SettingsScreenshotRenderer.demoUpdateCandidate(
+            currentVersion: "",
+            currentBuild: ""
+        )
+        #expect(candidate.displayVersion == "999.0.0")
+        #expect(candidate.buildVersion == "999999999")
+        #expect(UpdateVersion.isNewer(candidate.displayVersion, than: "2.0.2"))
+        #expect(Int(candidate.buildVersion)! > 320)
     }
 }

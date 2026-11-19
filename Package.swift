@@ -208,6 +208,18 @@ let profilesAuthorizedAccessAvailable = artifactSupportsAuthorizedAccess(module:
             .appendingPathComponent("Sources/SayAllButtonProfiles/ButtonProfilesAccessDecision.swift")
         return (try? String(contentsOf: source, encoding: .utf8))?.contains("case authorized") == true
     }
+let profileAutosaveAvailable = [buttonProfilesPackagePath,
+    privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+        URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+    } : nil].compactMap { $0 }.contains { path in
+    let api = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllButtonProfiles/SayAllButtonProfilesFeature.swift")
+    return (try? String(contentsOf: api, encoding: .utf8))?.contains("public func displayProfiles()") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let api = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllButtonProfiles.xcframework/macos-arm64_x86_64/SayAllButtonProfiles.framework/Modules/SayAllButtonProfiles.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: api, encoding: .utf8))?.contains("func displayProfiles()") == true
+    }
+} ?? false)
 let buttonProfilesTestAccessEnabled = ProcessInfo.processInfo.environment[
     "SAYALL_TEST_BUTTON_PROFILES_FREE"
 ] == "1"
@@ -248,6 +260,9 @@ if siriPermissionMonitorAvailable {
 }
 if membershipAuthorizedAccessAvailable {
     remoteMicSwiftSettings.append(.define("SAYALL_MEMBERSHIP_AUTHORIZED_ACCESS"))
+}
+if profileAutosaveAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_AUTOSAVE"))
 }
 if profilesAuthorizedAccessAvailable {
     remoteMicSwiftSettings.append(.define("SAYALL_PROFILES_AUTHORIZED_ACCESS"))
@@ -292,6 +307,36 @@ let buttonHoldModesAvailable = [buttonProfilesPackagePath, privateSwiftPMEnabled
     }
 } ?? false)
 if buttonHoldModesAvailable { remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_HOLD_MODES")) }
+/// 方案组件从该版本起持久化方向键按住（singleHold/longHold）。
+let directionalProfileHoldAvailable = [buttonProfilesPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+    URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+} : nil].compactMap { $0 }.contains { path in
+    let api = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllButtonProfiles/SayAllButtonProfilesFeature.swift")
+    return (try? String(contentsOf: api, encoding: .utf8))?.contains("supportsDirectionalHoldModes") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let api = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllButtonProfiles.xcframework/macos-arm64_x86_64/SayAllButtonProfiles.framework/Modules/SayAllButtonProfiles.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: api, encoding: .utf8))?.contains("supportsDirectionalHoldModes") == true
+    }
+} ?? false)
+if directionalProfileHoldAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_DIRECTIONAL_HOLD"))
+}
+/// 键位方案组件提供「只重读宏库」的入口后，宿主才能在跨进程写入后刷新组合动作名。
+let buttonProfileMacroReloadAvailable = [buttonProfilesPackagePath, privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+    URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+} : nil].compactMap { $0 }.contains { path in
+    let api = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllButtonProfiles/SayAllButtonProfilesFeature.swift")
+    return (try? String(contentsOf: api, encoding: .utf8))?.contains("public func reloadMacroLibrary()") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let api = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllButtonProfiles.xcframework/macos-arm64_x86_64/SayAllButtonProfiles.framework/Modules/SayAllButtonProfiles.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: api, encoding: .utf8))?.contains("func reloadMacroLibrary()") == true
+    }
+} ?? false)
+if buttonProfileMacroReloadAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_MACRO_RELOAD"))
+}
 /// 契约边界用版本号表达（docs/release/packaging-governance.md §4），不探测私有源码特征。
 /// 只有走 artifact 时才需要判断版本；本地指向私有源码即视为最新。
 let privatePlatformManifestVersion: (Int, Int, Int)? = {
@@ -328,7 +373,11 @@ var remoteMicLinkerSettings: [LinkerSetting] = []
 if privateArtifactsAvailable { remoteMicLinkerSettings.append(.unsafeFlags(["-Xlinker", "-ObjC"])) }
 
 var remoteMicTestSwiftSettings: [SwiftSetting] = []
+if profileAutosaveAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_AUTOSAVE")) }
 if buttonHoldModesAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_BUTTON_HOLD_MODES")) }
+if directionalProfileHoldAvailable {
+    remoteMicTestSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_DIRECTIONAL_HOLD"))
+}
 if bindingTextAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_BINDING_TEXT")) }
 if screenshotProfileSeedAvailable { remoteMicTestSwiftSettings.append(.define("SAYALL_SCREENSHOT_PROFILE_SEED")) }
 if sourceMacroHostShortcutsAvailable || artifactMacroHostShortcutsAvailable {
@@ -621,7 +670,8 @@ let package = Package(
             name: "RemoteMicTests",
             dependencies: remoteMicTestDependencies + ["SayAllMCPKit", "AppleRemoteHCIProtocol"],
             path: "Tests/RemoteMicTests",
-            exclude: macRemoteEnabled ? [] : ["WatchBluetoothVoiceJourneyTests.swift"],
+            // This suite exercises internal source-only BLE hooks. Distribution binaries do not export them.
+            exclude: macRemoteEnabled && !privateArtifactsAvailable ? [] : ["WatchBluetoothVoiceJourneyTests.swift"],
             swiftSettings: remoteMicTestSwiftSettings
         ),
     ],

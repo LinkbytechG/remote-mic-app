@@ -1,6 +1,6 @@
 # Version History
 
-## 2.0.0 (Pre-release)
+## 2.0.8 (Pre-release)
 
 - Adds Common Phrases: insert frequently used text in one press, with editing and import/export.
 - Macros can run Shell and AppleScript scripts.
@@ -26,6 +26,45 @@
 - Fixes voice keys not recovering after a disconnect or wake, missing sound, dropped first words and a failing second session.
 - Fixes a configuration-import security issue, and unclear notices for corrupted or partially imported settings.
 - Fixes update checks missing new versions, calendar misalignment and clipped interface text.
+
+## 2.0.6 (Pre-release)
+
+- Remote cards: the buttons page header, the current device on the connection page, and previously connected devices now share one three-line card with the model, Bluetooth name, overall status, and valid battery information.
+- Overall status: Connected means local buttons and the authorized voice path are usable. Confirmed faults show Button Issue, Voice Issue, or Device Issue first. Starting states show Checking or Confirming Status.
+- Previous devices: connection history includes Apple and Chromecast profiles. The last Bluetooth name is kept when a device disconnects or its name cannot be read. An uninstalled Apple component offers Enable, and a voice entry without membership offers Join Plus.
+- Membership: Plus benefits are split into six rows, with separate notes for the iOS app and Apple Watch app. Purchase copy now says one purchase, no automatic renewal.
+- Installer: the license page syncs the November 16, 2026 privacy policy, covering the encrypted cloud relay for the web version and mini program, no recording storage on the relay, and LAN-first nearby connections.
+
+## 2.0.4 (Pre-release)
+
+- Fixed an issue where one failed ordinary button action could disable all remote buttons.
+- Custom apps that still need focus verification now open and show a verification notice.
+
+## 2.0.3 (Pre-release)
+
+- Remote buttons: fixes ordinary buttons not responding on macOS 27 while the remote remains connected; falls back to the manager report path when device callbacks go silent and rebuilds HID monitors after discovering a new remote; the voice key is unaffected.
+- Connection reliability: fixes ordinary buttons failing after a newly discovered remote's profile monitor was not rebuilt.
+- Notice bubbles: updates bubble width, shadow, and success-notice placement to match the design.
+
+## 2.0.2 (Pre-release)
+
+- Adds Common Phrases, with editing, import/export and one-press insertion.
+- Macros can run Shell and AppleScript scripts; save several Button Profiles and switch them with the frontmost app.
+- Supports Apple Remote 6th generation (Lightning, A2540) and 7th generation (Type-C, A2854).
+- Apple Watch connects more reliably and supports Double Tap to start and stop recording; control this Mac with the WeChat mini program.
+- Buy membership with WeChat virtual payment or redeem a code; Profile adds a usage calendar, local leaderboards and sharing, plus a new Recommendations page.
+- Back up and restore a complete configuration; installers use Installer PKG with a matching uninstaller.
+- The voice key adds Left and Right Option triggers; Xiaomi remotes warn as a single voice session approaches the 60-second limit.
+- Control menu bar and Dock icons separately; the menu bar icon dims when no device is connected, and the app icon can be switched.
+- Voice key and audio: fixes the voice key becoming unusable or repeatedly triggering system dictation after a reconnect; fixes remote buttons stopping after some key mappings on macOS 27; fixes heavy audio loss after rebinding during a voice session; waits for the audio tail to drain before release to reduce dropped last words; ends long recordings correctly near the 60-second limit.
+- Microphones: supports AirPods microphone capture; the voice devices page highlights the current input and lets you disable it; the compatible microphone entry on the connection page moves to voice devices.
+- Buttons and button profiles: edit and auto-save directly on the buttons page; button profiles can be read-only or copied in full; shortcut and focus bindings inside a profile are editable, and hold dependencies are cleared when an action changes; custom buttons gain their own filter and basic key titles; the left and right keys support holding arrow keys; the key-speed panel moves recognition timing before learning; renaming a macro refreshes the buttons page and button profiles immediately.
+- Remotes and app switcher: shows real RC001 and RC003 photos by model; the app switcher follows native interaction, and Back no longer brings the highlighted app to the front; fixes Intel arrow keys moving twice per press; fixes a Caps Lock system event crashing the input method in the background.
+- Connection stability: pauses idle nearby services while the system sleeps; restores direct probes for saved devices after wake; audio recovery is more reliable after sleep, wake and disconnect.
+- Settings and interface: renames the App Adaptation page to Focus and Paging; adds a shared notice bar to the buttons and common phrases pages; fixes header jitter on the empty buttons page; removes the duplicate entry on the Reflections page; decorative icons use the accent color; first-run setup no longer shows an unhelpful AI prompt.
+- Membership: keeps the verification-code resend countdown when the login page reopens; adds a membership entry to the button profiles header.
+- Performance and diagnostics: speeds up the first switch to Reflections; merges duplicate update checks on the About page; raises the encrypted diagnostic log segment limit to 10 MB; the same button no longer runs twice.
+- Common Phrases, Button Profiles, Apple Remote voice, and iPhone, Apple Watch and mini program connections require Plus.
 
 ## 1.9.21 (Pre-release)
 

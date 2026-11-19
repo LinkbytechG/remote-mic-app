@@ -76,11 +76,8 @@ struct UpdateCheckPolicy: Equatable {
 }
 
 enum SettingsWindowActivationPolicy {
-    static func value(
-        showDockIcon: Bool,
-        isSettingsWindowOpen _: Bool
-    ) -> NSApplication.ActivationPolicy {
-        showDockIcon ? .regular : .accessory
+    static func value(showDockIcon: Bool, isSettingsWindowOpen: Bool) -> NSApplication.ActivationPolicy {
+        (showDockIcon || isSettingsWindowOpen) ? .regular : .accessory
     }
 }
 
@@ -164,13 +161,16 @@ enum RemoteMicApp {
         }
         let bundleIdentifier = Bundle.main.bundleIdentifier
             ?? ApplicationInstanceGuard.fallbackBundleIdentifier
-        let existingInstances = NSRunningApplication.runningApplications(
+        // runningApplications includes this process; expose the other-instance count
+        // explicitly so a normal existing_instances=1 is not mistaken for a duplicate.
+        let runningInstances = NSRunningApplication.runningApplications(
             withBundleIdentifier: bundleIdentifier
         ).count
+        let otherInstances = max(0, runningInstances - 1)
         AppLogger.shared.write(
             "APP INSTANCE phase=launch bundle_id=\(bundleIdentifier) " +
                 "pid=\(ProcessInfo.processInfo.processIdentifier) " +
-                "existing_instances=\(existingInstances)"
+                "existing_instances=\(runningInstances) other_instances=\(otherInstances)"
         )
         var instanceLock: ApplicationInstanceLock?
         if let lockURL = ApplicationInstanceGuard.defaultLockURL() {
@@ -212,7 +212,7 @@ enum RemoteMicApp {
         let application = NSApplication.shared
         let delegate = RemoteMicAppDelegate()
         application.delegate = delegate
-        application.setActivationPolicy(delegate.activationPolicy)
+        delegate.updateDockActivationPolicy(source: "launch")
         withExtendedLifetime(instanceLock) {
             withExtendedLifetime(delegate) {
                 application.run()
@@ -225,16 +225,14 @@ enum RemoteMicApp {
 private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation,
     NSWindowDelegate, SPUUpdaterDelegate, @preconcurrency SPUStandardUserDriverDelegate
 {
-    private enum UpdateCheckPurpose {
-        case information
-        case userInitiated
-    }
-
     /// 设置窗口的默认尺寸与最小尺寸（整窗，含标题栏）。
     ///
-    /// 数值取自用户确认的按键页截图（实测整窗 1067×771）。默认值和最小值都绑这一个常量，
+    /// 数值取自用户确认的按键页截图（实测整窗 1067×760）。默认值和最小值都绑这一个常量，
     /// 避免两处各写一遍后再次漂移。
-    private static let settingsWindowFrameSize = NSSize(width: 1067, height: 771)
+    ///
+    /// 760 必须等于 `SettingsView.minimumContentSize` 的高度 732 加标题栏 28：内容下限比
+    /// 整窗下限高时，SwiftUI 会在首次布局后把窗口压回内容下限，常量就只剩记录作用。
+    private static let settingsWindowFrameSize = NSSize(width: 1067, height: 760)
 
     private let model = BridgeAppModel()
     private lazy var appIconController = AppIconController()
@@ -261,7 +259,16 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         stableFeedURLString: Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String
     )
     private var updateCheckTask: Task<Void, Never>?
+    private var updateChecks = UpdateCheckCoordinator()
     private let buttonProfileImportRequests = ButtonProfileImportRequestStore()
+    private let searchFocusCoordinator = SearchFocusCoordinator()
+    /// 「编辑 > 查找…」当前实例。`configureApplicationMenu()` 在语言切换后会重建菜单，
+    /// 因此这里必须保存最新引用，供 `validateMenuItem` 判断。
+    private var findMenuItem: NSMenuItem?
+    private let settingsNavigation = SettingsNavigationStore()
+    /// 「前往」菜单。`configureApplicationMenu()` 在语言切换后会重建菜单，
+    /// 因此保存最新引用，供 `menuNeedsUpdate` 识别。
+    private var goMenu: NSMenu?
     private var resolvedUpdateFeedURLString: String?
     private var updaterStarted = false
     private lazy var updaterController = SPUStandardUpdaterController(
@@ -275,14 +282,11 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private let hidItem = NSMenuItem()
     private let macMicrophoneItem = NSMenuItem()
 
-    var activationPolicy: NSApplication.ActivationPolicy {
-        SettingsWindowActivationPolicy.value(
-            showDockIcon: model.settings.showDockIcon,
-            isSettingsWindowOpen: false
-        )
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppLogger.shared.write(
+            "APP BUILD diagnostic_schema=3 phase=completed result=metadata_observed " +
+                FirstUseDiagnosticSnapshot.buildIdentityFields(Bundle.main.infoDictionary ?? [:])
+        )
         if let environmentEvent = AppEnvironmentSnapshot.current(
             settings: model.settings
         ).publicEvent {
@@ -352,7 +356,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         if shouldShowMainWindow {
             if !baseLaunchDecision {
                 AppLogger.shared.write(
-                    "UI ENTRY_POINT phase=completed result=passed source=launch_recovery " +
+                    "UI ENTRY_POINT phase=decision result=required source=launch_recovery " +
                         "show_dock=false show_status_bar=false decision=open_settings"
                 )
             }
@@ -361,7 +365,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 if shouldOpenPermissionRepair {
                     self.showSettingsWindow(initialSection: .about)
                 } else {
-                    self.showSettings()
+                    self.showSettingsWindow()
                 }
                 // 升级后不再弹「已成功更新到版本」确认框：完成更新的人已经知道版本变了，
                 // 弹窗只是挡住刚打开的窗口。主窗口与权限修复照旧自动呈现。
@@ -388,6 +392,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        model.refreshRemoteDiscovery()
         model.refreshRemoteDeviceNames(reason: .foreground)
         model.privateFeature.refreshAccessIfNeeded()
         model.macroFeature.refreshAccessIfNeeded()
@@ -399,7 +404,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         _ sender: NSApplication,
         hasVisibleWindows flag: Bool
     ) -> Bool {
-        showSettings()
+        showSettingsWindow()
         AppLogger.shared.write(
             "UI ENTRY_POINT phase=completed result=passed source=application_reopen " +
                 "show_dock=\(model.settings.showDockIcon) " +
@@ -418,7 +423,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 "BUTTON_PROFILE_IMPORT phase=requested result=accepted " +
                     "source=finder_file operation_id=button_profile_import_\(request.operationID)"
             )
-            showSettings()
+            showSettingsWindow()
         }
 
         guard let request = urls.lazy.compactMap(SayAllDeepLinkRequest.parse).first else {
@@ -433,7 +438,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             name: .sayAllDeepLinkReceived,
             object: request
         )
-        showSettings()
+        showSettingsWindow()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -464,7 +469,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         ]
         workspaceAudioLifecycleObservers = events.map { name, event in
             notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor [weak self] in
+                MainActor.assumeIsolated { [weak self] in
                     guard let self else { return }
                     self.model.handleSystemAudioLifecycle(event)
                     if event == .systemDidWake {
@@ -481,7 +486,51 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        menuItem !== macMicrophoneItem || model.macMicrophoneState != .stopping
+        if let findMenuItem, menuItem === findMenuItem {
+            // 纯状态查询：打开「编辑」菜单本身不得产生聚焦副作用。
+            return searchFocusCoordinator.hasRegisteredSearchField
+        }
+        return menuItem !== macMicrophoneItem || model.macMicrophoneState != .stopping
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === statusMenu {
+            StatusMenuBatterySection.update(
+                in: menu, before: audioItem, profiles: model.settings.remoteDeviceProfiles,
+                connectedIDs: model.connectedRemoteProfileIDs, levels: model.remoteBatteryLevels,
+                powerStates: model.remotePowerStates, localization: localization
+            )
+            return
+        }
+        guard let goMenu, menu === goMenu else { return }
+        menu.removeAllItems()
+        for section in settingsNavigation.visibleSections {
+            let shortcut = SettingsPageBehavior.sidebarShortcutOrder.firstIndex(of: section)
+            let item = NSMenuItem(
+                title: settingsSectionTitle(section),
+                action: #selector(selectSettingsSection(_:)),
+                keyEquivalent: ""
+            )
+            item.representedObject = section.rawValue
+            if let shortcut {
+                item.keyEquivalent = String(shortcut + 1)
+                item.keyEquivalentModifierMask = .command
+            }
+            item.target = self
+            menu.addItem(item)
+        }
+    }
+
+    /// 私有页签的标题由私有组件提供（`SettingsSection.titleKey` 对它们返回空串），
+    /// 这里现算，避免语言切换后菜单里出现空白标题。
+    private func settingsSectionTitle(_ section: SettingsSection) -> String {
+        switch section {
+        case .macros: return model.macroFeature.sectionTitle
+        case .buttonProfiles: return model.macroFeature.buttonProfilesSectionTitle
+        case .membership: return model.membershipFeature.sectionTitle
+        case .privateFeature: return model.privateFeature.sectionTitle
+        default: return localization.text(section.titleKey)
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -566,9 +615,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let changed = isVisible ? configureStatusItem() : removeStatusItem()
         AppLogger.shared.write(
             "UI ENTRY_POINT operation_id=\(operationID) phase=completed result=passed " +
-                "source=\(source) show_dock=\(model.settings.showDockIcon) " +
-                "show_status_bar=\(isVisible) " +
-                "both_hidden=\(!model.settings.showDockIcon && !isVisible) " +
+                "source=\(source) show_dock=\(model.settings.showDockIcon) show_status_bar=\(isVisible) " +
                 "change=\(changed ? (isVisible ? "created" : "removed") : "none")"
         )
     }
@@ -581,7 +628,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
         let menu = NSMenu()
         menu.delegate = self
-        menu.addItem(menuItem("menu.open_settings", action: #selector(showSettings)))
+        menu.addItem(menuItem("menu.open_settings", action: #selector(showSettingsFromStatusMenu)))
         menu.addItem(.separator())
         menu.addItem(connectionItem)
         menu.addItem(audioItem)
@@ -666,8 +713,29 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         editMenu.addItem(responderMenuItem("common.action.paste", action: "paste:", keyEquivalent: "v"))
         editMenu.addItem(.separator())
         editMenu.addItem(responderMenuItem("common.action.select_all", action: "selectAll:", keyEquivalent: "a"))
+        editMenu.addItem(.separator())
+        let findItem = NSMenuItem(
+            title: localization.text("common.action.find"),
+            action: #selector(focusVisibleSearchField),
+            keyEquivalent: "f"
+        )
+        findItem.keyEquivalentModifierMask = [.command]
+        // 不能用 responderMenuItem：它会把 target 置 nil，让 AppKit 把动作路由到
+        // 当前聚焦的文本框；而 ⌘F 需要由宿主统一决定聚焦哪个搜索框。
+        findItem.target = self
+        editMenu.addItem(findItem)
+        findMenuItem = findItem
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
+
+        let goMenuItem = NSMenuItem()
+        let goMenu = NSMenu(title: localization.text("menu.go"))
+        // 页签可见性随会员开通、私有功能启停与 supplemental 动态页变化，
+        // 因此每次打开菜单时按当前可见页签重建，避免标题或快捷键标签陈旧。
+        goMenu.delegate = self
+        goMenuItem.submenu = goMenu
+        self.goMenu = goMenu
+        mainMenu.addItem(goMenuItem)
 
         let windowMenuItem = NSMenuItem()
         let windowMenu = NSMenu(title: localization.text("menu.window"))
@@ -714,10 +782,58 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             case "w":
                 self?.closeKeyWindow()
                 return nil
+            case "f":
+                // 与既有 ⌘Q / ⌘W 同一范式：本地监听先于菜单 keyEquivalent 派发，
+                // 返回 nil 后按键路径由此统一处理，菜单项保留 ⌘F 用于显示与鼠标点击。
+                // 无条件吞掉也保证没有可用搜索框时静默（灰掉的菜单项不会再引发
+                // AppKit 对未处理 ⌘F 的提示音）；是否聚焦由内部 guard 决定。
+                self?.performSearchFocus()
+                return nil
+            case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+                // 与 ⌘Q / ⌘W 同一范式：本地监听先于菜单 keyEquivalent 派发，
+                // 返回 nil 后按键路径由此统一处理，菜单项保留 ⌘N 用于显示与鼠标点击。
+                self?.requestSettingsSection(from: event)
+                return nil
             default:
                 return event
             }
         }
+    }
+
+    @objc private func focusVisibleSearchField() {
+        performSearchFocus()
+    }
+
+    /// 菜单项与本地监听共用同一条路径，重复调用幂等。
+    /// 没有可用搜索框时既不广播也不吞掉已有焦点。
+    private func performSearchFocus() {
+        // 「常用语浮窗」等独立窗口也复用带搜索框的页面；只有设置窗口是 key window
+        // 时才聚焦，避免把浮窗里的搜索框抢过来。
+        guard settingsWindowController?.window?.isKeyWindow == true,
+              searchFocusCoordinator.hasRegisteredSearchField
+        else { return }
+        searchFocusCoordinator.requestFocus()
+    }
+
+    private func requestSettingsSection(from event: NSEvent) {
+        guard let digit = event.charactersIgnoringModifiers?.first,
+              let index = Int(String(digit)),
+              index <= SettingsPageBehavior.sidebarShortcutOrder.count
+        else { return }
+        let section = SettingsPageBehavior.sidebarShortcutOrder[index - 1]
+        requestSettingsSection(rawValue: section.rawValue)
+    }
+
+    @objc private func selectSettingsSection(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        requestSettingsSection(rawValue: raw)
+    }
+
+    private func requestSettingsSection(rawValue: String) {
+        let section = SettingsSection(rawValue: rawValue)
+        // 不可见的目标不生效，也不跳到别的页签；「前往」菜单本身就只列可见页签。
+        guard settingsNavigation.visibleSections.contains(section) else { return }
+        settingsNavigation.request(section: section)
     }
 
     private func menuItem(_ title: String, action: Selector) -> NSMenuItem {
@@ -892,7 +1008,9 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             .receive(on: RunLoop.main)
             .sink { [weak self] isEnabled in
                 guard let self else { return }
+                updateChecks.invalidate(cancelPreparation: updateCheckTask != nil)
                 updateCheckTask?.cancel()
+                updateCheckTask = nil
                 resolvedUpdateFeedURLString = nil
                 updateInformation.reset()
                 let policy = UpdateCheckPolicy(checksForPreReleaseUpdates: isEnabled)
@@ -968,10 +1086,19 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             ? localization.text("connection.status.voice_active")
             : model.audioStatus.text(using: localization)
         hidItem.title = model.hidStatus.text(using: localization)
-        macMicrophoneItem.title = localization.text(model.macMicrophoneButtonKey)
+        macMicrophoneItem.title = model.macMicrophoneButtonTitle(using: localization)
+        if model.macMicrophoneEnabled {
+            macMicrophoneItem.attributedTitle = NSAttributedString(
+                string: macMicrophoneItem.title,
+                attributes: [.foregroundColor: NSColor.systemRed]
+            )
+        } else {
+            macMicrophoneItem.attributedTitle = nil
+        }
         macMicrophoneItem.toolTip = localization.text("audio.mac_microphone.help")
         macMicrophoneItem.state = model.macMicrophoneEnabled ? .on : .off
         macMicrophoneItem.isEnabled = model.macMicrophoneState != .stopping
+        macMicrophoneItem.isHidden = !model.macMicrophoneSelectedDeviceIsReady
     }
 
     private func refreshStatusItemPresentation() {
@@ -1037,9 +1164,10 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             0,
             Int((ProcessInfo.processInfo.systemUptime - operation.startedAt) * 1_000)
         )
+        let batteryRows = operation.menu.items.filter { $0.identifier == StatusMenuBatterySection.itemIdentifier }.count
         AppLogger.shared.write(
             "UI STATUS_MENU operation_id=\(operation.id) phase=completed " +
-                "result=\(result) reason=\(reason) elapsed_ms=\(elapsedMilliseconds)"
+                "result=\(result) reason=\(reason) elapsed_ms=\(elapsedMilliseconds) battery_rows=\(batteryRows)"
         )
     }
 
@@ -1052,7 +1180,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         model.reconnect()
     }
 
-    @objc private func showSettings() {
+    @objc private func showSettingsFromStatusMenu() {
         showSettingsWindow()
     }
 
@@ -1065,7 +1193,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         guard let windowController = settingsWindowController,
               let window = windowController.window else { return }
         isSettingsWindowOpen = true
-        updateDockActivationPolicy()
+        updateDockActivationPolicy(source: "window_open")
         windowController.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -1078,6 +1206,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             rootView: RemoteMicRootView(
                 model: model,
                 buttonProfileImportRequests: buttonProfileImportRequests,
+                settingsNavigation: settingsNavigation,
                 updateInformation: updateInformation,
                 hardwareAnnouncements: hardwareAnnouncements,
                 checkForUpdates: { [weak self] in self?.checkForUpdates() },
@@ -1141,7 +1270,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         else { return }
         model.macroFeature.setEditorActive(false)
         isSettingsWindowOpen = false
-        updateDockActivationPolicy()
+        updateDockActivationPolicy(source: "window_close")
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
@@ -1201,10 +1330,23 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         performUpdateCheck(.information)
     }
 
-    private func performUpdateCheck(_ purpose: UpdateCheckPurpose) {
-        updateCheckTask?.cancel()
+    private func performUpdateCheck(_ purpose: UpdateCheckCoordinator.Purpose) {
+        let decision = updateChecks.request(
+            purpose,
+            sessionInProgress: updaterStarted && updaterController.updater.sessionInProgress
+        )
+        guard decision == .start else {
+            AppLogger.shared.write(
+                "UPDATE CHECK phase=completed result=reused " +
+                    "reason=\(decision == .cached ? "fresh_information" : "check_in_progress")"
+            )
+            return
+        }
         updateCheckTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if !Task.isCancelled { updateCheckTask = nil }
+            }
             updateInformation.beginChecking()
             let includePreRelease = model.settings.checksForPreReleaseUpdates
             let testFeed = UpdateFeedResolver.testInjectedFeed(
@@ -1231,6 +1373,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 }
                 guard !Task.isCancelled else { return }
                 guard let selectedFeed = resolution.selected else {
+                    finishUpdateCheck(success: false)
                     updateInformation.setUnavailable()
                     AppLogger.shared.write(
                         "UPDATE CHECK prerelease_enabled=true resolved=false " +
@@ -1249,6 +1392,7 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 )
             } else {
                 guard updateFeedSelection.feedURLString(checksForPreReleaseUpdates: false) != nil else {
+                    finishUpdateCheck(success: false)
                     updateInformation.setUnavailable()
                     AppLogger.shared.write(
                         "UPDATE CHECK prerelease_enabled=false resolved=false " +
@@ -1262,7 +1406,13 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 )
             }
             startUpdaterIfNeeded()
-            guard !updaterController.updater.sessionInProgress else { return }
+            guard !updaterController.updater.sessionInProgress else {
+                let queuedUserCheck = updateChecks.finish(success: false)
+                if purpose == .userInitiated || queuedUserCheck {
+                    _ = updateChecks.request(.userInitiated, sessionInProgress: true)
+                }
+                return
+            }
             switch purpose {
             case .information:
                 updateInformation.beginChecking()
@@ -1335,16 +1485,25 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         if error != nil, updateInformation.state == .checking {
             updateInformation.setUnavailable()
         }
+        let success: Bool
+        switch updateInformation.state {
+        case .available, .upToDate: success = true
+        case .idle, .checking, .unavailable: success = false
+        }
+        finishUpdateCheck(success: success)
+    }
+
+    private func finishUpdateCheck(success: Bool) {
+        guard updateChecks.finish(success: success) else { return }
+        Task { @MainActor [weak self] in
+            // Let Sparkle finish closing its previous session before opening the requested UI.
+            self?.performUpdateCheck(.userInitiated)
+        }
     }
 
     private func setDockIconVisible(_ isVisible: Bool) {
         model.settings.showDockIcon = isVisible
-        updateDockActivationPolicy()
-        AppLogger.shared.write(
-            "UI ENTRY_POINT phase=completed result=passed source=dock_toggle " +
-                "show_dock=\(isVisible) show_status_bar=\(model.settings.showStatusBarIcon) " +
-                "both_hidden=\(!isVisible && !model.settings.showStatusBarIcon)"
-        )
+        updateDockActivationPolicy(source: "dock_toggle")
     }
 
     private func setStatusBarIconVisible(_ isVisible: Bool) {
@@ -1353,19 +1512,35 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func applyImportedEntryPointVisibility() {
-        updateDockActivationPolicy()
+        updateDockActivationPolicy(source: "configuration_import")
         applyStatusBarIconVisibility(
             model.settings.showStatusBarIcon,
             source: "configuration_import"
         )
     }
 
-    private func updateDockActivationPolicy() {
-        NSApp.setActivationPolicy(SettingsWindowActivationPolicy.value(
+    func updateDockActivationPolicy(source: String) {
+        entryPointOperationID &+= 1
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let policy = SettingsWindowActivationPolicy.value(
             showDockIcon: model.settings.showDockIcon,
             isSettingsWindowOpen: isSettingsWindowOpen
-        ))
-        reapplyCurrentAppIcon(source: "activation_policy")
+        )
+        let fields = "operation_id=\(entryPointOperationID) source=\(source) " +
+            "show_dock=\(model.settings.showDockIcon) window_open=\(isSettingsWindowOpen) " +
+            "target_policy=\(policy == .regular ? "regular" : "accessory")"
+        AppLogger.shared.write("UI DOCK_POLICY phase=requested \(fields)")
+        let unchanged = NSApp.activationPolicy() == policy
+        let applied = unchanged || NSApp.setActivationPolicy(policy)
+        if applied && !unchanged {
+            reapplyCurrentAppIcon(source: "activation_policy")
+        }
+        let elapsedMilliseconds = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1_000)
+        AppLogger.shared.write(
+            "UI DOCK_POLICY phase=completed result=\(applied ? "applied" : "failed") " +
+                "reason=\(applied ? "policy_active" : "appkit_rejected") " +
+                "elapsed_ms=\(elapsedMilliseconds) dock_visible=unknown \(fields)"
+        )
     }
 
     @objc private func openGitHub() {

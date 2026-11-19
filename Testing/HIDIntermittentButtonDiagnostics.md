@@ -17,7 +17,7 @@
 
 1. 在普通文本输入框中短按并松开 OK 键 10 次，每次间隔至少 1 秒。
 2. 每次应只执行一次配置动作。
-3. 每次日志应依次出现可对应的 `HID REPORT accepted`、`HID EDGE pressed=ok`、`HID GESTURE button=ok` 和 `HID BUTTON button=ok`；松开时应出现 `HID EDGE ... released=ok`。
+3. 每次日志应依次出现可对应的 `HID REPORT accepted`、`HID EDGE pressed=ok`、`HID GESTURE button=ok` 和 `HID BUTTON button=ok`；松开时应出现 `HID EDGE ... released=ok`。macOS 27 构建的 accepted/rejected 行还带 `path=device|manager`；`path=manager` 且出现 `HID REPORT PATH fallback=manager reason=device_silent` 表示 device 回调静默但 manager 兜底仍在工作。
 
 失败判定：动作缺失、重复，或日志在任意一层中断。
 
@@ -184,3 +184,100 @@ Windows 与网络控制入口未修改，保留稳定基线检查。
 
 失败判定：任何一个逗号之外还出现音量变化、音量浮层、额外字符、键盘音量被吞，或松键后音量连发。
 删除映射后的恢复回归仍按用例 5 执行。
+
+## 用例 7：方向键单次按下只移动一格（Intel 重点）
+
+适用：2026-11-07 之后把方向键纳入事件级兜底的包。更早的包方向键只靠源头映射，
+在独占失败、映射回读一致的 Intel 机器上一次按下会移动两格。
+必须在 Intel Mac 上执行；Apple Silicon 上源头映射通常能真正阻断原生投递，不能替代。
+
+注意：方向键兜底默认**只在 Intel 构建启用**（`#if arch(x86_64)`）。Apple Silicon 包上
+看到「没有 `HID FILTER arm events=key1xx`」是预期行为，不是修复缺失；判定 Apple Silicon
+只看行为（每次一格、键盘方向键不被吞）。
+
+1. 前置确认：日志里 `HID CONNECTED mode=monitored`、
+   `HID NATIVE MAPPING phase=prepare result=verified`，即非独占且映射回读一致。
+2. 左、右、上、下各短按 10 次，每次间隔至少 1 秒；每次只移动一格。
+3. 按住左方向键 2 秒后松开：按配置的重复策略移动，松开立即停止，速度不得翻倍。
+4. 每次方向键操作后立刻按一次电脑键盘的方向键，键盘必须正常生效；
+   连续两次都被吞判失败，仅紧邻窗口期的一次被吞不算失败。
+5. 触发 Command-Tab 会话后按左右键，高亮每次只移动一格。
+6. 反向边界：关闭「按键映射」或在映射未生效的设备上，默认左右动作仍应由系统原生事件完成，
+   每次按下同样只移动一格（不得变成零格）。
+
+日志判读：
+
+- 每次按下应出现 `HID FILTER arm events=key123`（或 key124/125/126）。
+- 泄漏的原生按下应是 `HID FILTER suppressed event=key1xx … armed_by=prearm|arm`；
+  `armed_by=prearm` 表示报告线程提前登记命中，是本修复生效的直接证据。
+- 出现 `HID FILTER phase=arm_order … result=already_passed_through` 即判失败：
+  原生方向键仍跑在登记之前。
+- 出现 `HID FILTER phase=arm result=passthrough event=key1xx edge=down reason=held_same_key`：
+  说明按下的这一刻，电脑键盘上同一颗方向键还按着没松，这次遥控器按下放弃了事件级登记
+  （判据不变，属已知边界）。此时若同时看到原生方向键未被吞（双跳），按已记录的边界处理，
+  不要当成修复失效；先松开键盘方向键再复测一次即可区分。
+- 完全没有 `suppressed` 时先别判通过：说明这台机器上映射确实阻断了原生投递，
+  双跳另有原因，按 `Bugs/2026-11-07-intel-directional-double-step.md` 重新定位。
+
+失败判定：任一次按下移动两格、按住速度翻倍、透传会话变成零格，或键盘方向键连续被吞。
+
+## 用例 8：macOS 27 device 级报告回调与 native mapping 共存
+
+适用：包含 2026-11-14 macOS 27 修复的 2.0.0 候选包。必须在 macOS 27 上使用真实 RC003 或 RC001 执行。
+
+前置确认日志：
+
+```text
+HID REPORT path=device+manager
+HID REPORT device_callback registered path=device
+HID NATIVE MAPPING phase=prepare result=verified
+HID CONNECTED mode=monitored
+```
+
+1. 方向键、OK、音量加/减各短按 10 次，每次间隔至少 1 秒；每次只能产生一次动作。
+2. TV 键短按和快速连按；不得弹出额外系统界面或向输入框写入字符。
+3. Power 键短按；不得锁屏或睡眠。
+4. 按住左/右方向键 2 秒后松开；按住期间按配置连发，松开立即停止，速度不得翻倍。
+5. 语音键按住、松开、连续两轮；语音链路应保持正常。
+6. 退出并重新打开 App，重复步骤 1；断连后重连，重复步骤 1。
+7. 操作后用 Mac 键盘方向键和音量键做对照，键盘不得被吞。
+
+日志判读：
+
+- 每个普通按键按下应出现一次 `HID REPORT accepted`，随后出现对应 `HID EDGE pressed=...` 和 `HID BUTTON ...`；松开出现 `HID EDGE ... released=...`。
+- 同一物理按下出现两条 `HID REPORT accepted` 或两个 `HID BUTTON` 判失败，说明 device/manager 去重失效。
+- 完全没有 `HID REPORT accepted`，但 `HID CONNECTED` 和 `device_callback registered` 存在，且也没有 `path=manager` 的 accepted，判失败：两条路径都没有投递。
+- 出现 `HID FILTER suppressed` 不作为 macOS 27 修复的通过条件；本路径依赖 native mapping 在事件产生前阻断，事件 tap 只保留兜底。
+- `HID REPORT rejected reason=excluded_fingerprint` 来自发现监视器让位，属正常；其他拒绝原因按故障处理。
+
+失败判定：任一按键无动作、重复动作、TV/Power 原生动作泄露、语音异常，或键盘同码按键被吞。
+
+## 2026-11-15 macOS 27 device 回调静默与 manager 兜底
+
+适用：包含 `HID REPORT PATH` 日志和双路径实际投递去重的构建。
+
+1. 启动 App，确认遥控器已连接。启动后立即短按方向键、OK 和菜单键各 3 次。
+2. 等待至少 20 秒，再重复上述按键。此窗口覆盖 BLE ready 触发的第二次 HID 监视器启动。
+3. 点击连接页“立即重新连接”，连接恢复后立即重复上述按键。
+4. 让 Mac 睡眠 30 秒后唤醒，等待遥控器重新连接，再重复上述按键。
+5. 快速连续短按同一个键 10 次，并按住方向键 2 秒后松开。
+
+预期：
+
+- 每次物理按下只执行一次动作，不得重复。
+- 每次按下出现一条 `HID REPORT accepted ... path=device` 或 `path=manager`。
+- 同一份物理报告最多出现一条 accepted，不得同时出现 device 和 manager 两条 accepted。
+- 如果 device 路径静默，允许出现 `HID REPORT PATH fallback=manager reason=device_silent`；按键仍必须正常执行。
+- device 路径恢复后出现 `HID REPORT PATH device_delivery=recovered`。
+- 持续按键时，`HID REPORT PATH WINDOW` 最多每 10 秒一行。
+- `HID REPORT PATH watchdog result=candidate` 和 `callback_reregistered` 最多每 60 秒一次，每个 HID 监视器实例最多 3 次；不得无限重试。
+- 日志不得包含原始 HID payload、设备 UUID、HID 指纹、输入文字或语音内容。
+
+失败判定：
+
+- `HID CONNECTED` 和 `device_callback registered` 存在，但没有任何 accepted，且 manager 路径也没有 accepted。
+- 同一物理按下出现两条 accepted 或两个 `HID BUTTON`。
+- `HID REPORT PATH WINDOW` 每 10 秒超过一行，或每次报告都出现 fallback/watchdog 行，造成日志爆炸。
+- 断连重连、睡眠唤醒或快速连按后出现丢键、重复动作、TV/Power 原生动作泄露或键盘同码按键被吞。
+
+自动化只验证去重策略与既有按键行为；真实 macOS 27 IOHID 投递、睡眠唤醒和 RC001/RC003 手势仍需真机执行。

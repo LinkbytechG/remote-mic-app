@@ -63,11 +63,19 @@ G-TOOL.permanent-helper=declared-purpose
 
 ## 本地测试包
 
+```governance-policy
+G-LOCAL.public=developer-self-use
+G-LOCAL.public-signing=ad-hoc-or-developer-id
+G-LOCAL.integrated=private-required
+G-LOCAL.distribution=release-trust
+```
+
 - 本地测试包固定命名 `SayAll.app`，优先替换 `~/Applications/SayAll.app`；替换失败才放 `~/Downloads/SayAll-test/SayAll.app`。
 - 每次构建必须递增 `CFBundleVersion`：取 `/Applications/SayAll.app`、`~/Applications/SayAll.app`、状态文件 `~/.sayall-local-build` 三者最大值 +1，写入本地包的 `Info.plist`；仓库 `Resources/Info.plist` 的模板值不得改动。
-- 打包统一走本仓 `scripts/package-local-test-app.sh`，不得手拼命令。该脚本入库、随仓库分发，已包含 release 构建、组装、递增构建号、ad-hoc 签名、先退出占锁实例再替换与启动。
-- 脚本要求 `SAYALL_PRIVATE_SOURCE_ROOT` 指向私有仓工作区根目录；缺私有组件时脚本直接报错退出，不会产出缺件的包。
-- 本地包是测试产物：必须如实记录 `source_commit` 与是否 dirty，不得冒用 Tag，不得作为分发候选。
+- 统一入口为 `scripts/package-local-test-app.sh`，复用原生 `scripts/build-app.sh` 完成 release 构建、资源组装与签名，再递增构建号、校验、退出占锁实例、替换与启动。该入口区分公开开发自用和完整集成测试两种模式。
+- 公开开发自用使用 `SAYALL_PRIVATE_PLATFORM_MODE=public`，无私有输入时为默认模式。只要求公开仓库访问权限，允许本机 ad-hoc 或 Developer ID 签名。产物记录 `SayAllBuildChannel=public`、公开组件标识、完整 `source_commit` 与 dirty 状态。公开功能必须可以启动，未包含的私有能力按公开兼容层报告不可用。该模式仅供构建者在本机开发自用。
+- 完整集成测试使用 `SAYALL_PRIVATE_PLATFORM_MODE=required`；既有调用提供私有源码或预构件且未指定模式时，继续选择此模式。要求 `SAYALL_PRIVATE_SOURCE_ROOT`、与清单固定 Tag 对应的 `SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH` 和本机 Developer ID `CODE_SIGN_IDENTITY`。缺件或签名不满足要求即失败。
+- 提供给他人安装的资产按 `RELEASING.md` 执行 Developer ID、Apple 公证、staple 和适用的下载复验。公开自用构建和完整集成本地测试构建均须如实标注来源与测试身份；作为分发候选时执行对应的完整发布门禁。
 
 ## 截图与设计稿归档规范
 
@@ -225,7 +233,7 @@ G-BUG.real-acceptance=retained
 - RC003 普通语音基线路径必须覆盖无需前置主动 `MIC_OPEN` 的 `STREAM_START → AUDIO → STREAM_STOP`。修改共享 ATVV 处理后，如果单元测试无法真实驱动 CoreBluetooth 回调，必须使用可注入事件回放或完成 RC003 真机基线验证，并明确记录自动化缺口。
 - 核心语音功能涉及多个组件时，必须增加连续用户旅程测试，而不能只分别测试“动作已提交”“输入框聚焦成功”“Fn 会话成功”或“音频已入队”。至少覆盖“执行 App/快捷键动作 → 目标延迟就绪 → 第一次 `STREAM_START → AUDIO → STREAM_STOP` → 最终只产生一组正确 Fn 与完整音频”；第二次或第三次才成功必须判定为失败。
 - `MIC_EXTEND` 能突破 RC003 约 60 秒限制在真机长录音通过前只能称为 ATVV 租期假设；模拟硬件只能验证保活策略，不能证明实际固件接受该命令。
-- macOS 设置页面内容或容器发生变化时，必须在生产窗口允许的最小尺寸逐一点击全部受影响的侧边栏入口，确认导航项、页头、主要控件和滚动均未裁切或改变窗口几何。当前生产最小尺寸为 `1020 × 772`；`800 × 650` 只作为离屏截图 harness 的窄宽压力检查，不得表述为真实生产窗口验收。
+- macOS 设置页面内容或容器发生变化时，必须在生产窗口允许的最小尺寸逐一点击全部受影响的侧边栏入口，确认导航项、页头、主要控件和滚动均未裁切或改变窗口几何。当前生产设置窗口最小尺寸为 `1067 × 760`（整窗，内容区 `1067 × 732`）；Onboarding 画布仍为 `1020 × 772`。`800 × 650` 只作为离屏截图 harness 的窄宽压力检查，不得表述为真实生产窗口验收。
 - 单元测试、构建、签名、公证和安装包校验通过，只能证明各自检查项通过，不能替代稳定行为验收。稳定基线未验证时，不得发布 Pre-release；实验功能本身可以保持“验证中”。
 - Mac 预览版发布后必须下载公开稳定版归档，并通过固定候选 appcast 执行一次真实 Sparkle 安装更新，不能只运行 `--probe`。更新后必须验证版本、签名、公证、Sparkle helper 权限与链接、启动/再次启动以及无新增崩溃报告。
 - 预览版必须保持 Pre-release，固定候选 feed 不得改变稳定 feed；发布和验证期间 `releases/latest` 必须继续指向当前稳定版。

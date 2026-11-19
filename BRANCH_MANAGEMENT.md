@@ -137,9 +137,9 @@ G-MERGE.default=merge
 
 ## 公开构建与私有集成边界
 
-- 公开仓库的默认 checkout 不得要求任何私有仓库权限。`Package.swift`、`Package.resolved` 和公开构建入口不得解析私有 Git URL；只有公开仓库访问权限的贡献者必须能完成 SwiftPM resolve、完整测试、双架构 Release build 和本地 App 构建。
+- 公开仓库的默认 checkout 不得要求任何私有仓库权限。`Package.swift`、`Package.resolved` 和公开构建入口不得解析私有 Git URL；只有公开仓库访问权限的贡献者必须能完成 SwiftPM resolve、完整测试、双架构 Release build 和本地 App 构建、启动。公开开发自用通过 `scripts/package-local-test-app.sh` 的 `public` 模式执行，允许本机 ad-hoc 或 Developer ID 签名；完整集成测试使用 `required` 模式，按 `AGENTS.md` 检查私有组件和 Developer ID。
 - 私有组件通过显式本地 Package 路径接入。未提供路径时，公开兼容层只保留编译契约并明确报告相关能力不可用，不得复制私有实现，也不得影响实体 HID、音频、设置等公开功能运行。
-- macOS CI 的公开测试与构建是强制门禁，必须显式清空私有 Package 路径后执行，不能因为 Secret、deploy key 或私有仓库不可访问而跳过。公开门禁失败时 Job 必须失败。
+- macOS CI 的公开测试与构建是强制门禁，必须显式清空私有 Package 路径后执行，不能因为 Secret、deploy key 或私有仓库不可访问而跳过。公开门禁失败时 Job 必须失败。公开门禁同时覆盖统一本地打包入口和本次产物的进程启动；构建与启动检查分别记录结果，硬件与语音结果仍执行实机验收。
 - CI 探测到全部受版本清单约束的私有依赖都可访问时，必须按固定 Commit 追加私有集成测试和双架构 Release build；这些检查失败时 Job 必须失败。权限缺失或私有仓库不可访问时，只允许跳过私有集成步骤，并输出明确的非敏感状态，不得打印 key 或凭据。
 - 受保护发布 Workflow 与普通 CI 不同，必须 fail closed：缺少任一发布所需私有组件、固定 Commit 校验失败或私有 checkout 失败时不得生成发布包。
 
@@ -162,13 +162,13 @@ G-MERGE.default=merge
 1. 功能或 Bug 先通过普通 PR 合入 main。若用户指定的 Commit 尚未进入主线，先从最新 origin/main 建立独立集成分支，只重放指定工作和必要依赖；冲突必须逐文件核对，不能以整支旧分支覆盖当前主线。
 2. 版本号、Build 和中英文 ReleaseHistory 属于发布元数据，也必须在普通 PR 中修改。使用 scripts/prepare-preview-release.sh 前，分支必须是从最新 origin/main 创建的干净分支；脚本只允许修改 Resources/Info.plist 和两份 ReleaseHistory.md。
 3. 普通版本的元数据 PR 合入后，发布源就是该次合入后的精确 `origin/main` SHA；不再做第二次分支同步或挑选 Commit。Hotfix 的版本元数据则与修复一起保留在对应 `hotfix/vX.Y.Z`。
-4. 请求版本已被公开 Tag、Release 或已上传的公开分发资产占用时，脚本只递增最后一位并选择更高 Build。公开资产占用检查覆盖 canonical CDN 固定路径：13 个 payload URL 只有明确 HTTP 404 才算可用；2xx/3xx 视为占用，认证、权限、5xx、超时或其他无法判断的响应 fail closed。Runner、GitHub、Apple、签名、公证或网络故障不会占用版本，不得因为这些故障升版本。
+4. 请求版本已被公开 Tag、Release 或已上传的公开分发资产占用时，脚本只递增最后一位并选择更高 Build。公开资产占用检查覆盖 `config/release-assets.json` 当前 manifest 定义的 canonical CDN 固定路径（当前 10 个 payload URL），只有明确 HTTP 404 才算可用；2xx/3xx 视为占用，认证、权限、5xx、超时或其他无法判断的响应 fail closed。Runner、GitHub、Apple、签名、公证或网络故障不会占用版本，不得因为这些故障升版本。
 
 ## 预览发布引用
 
 - 预览 staging 的发布控制 Workflow 只从精确 `origin/main` 触发。scripts/stage-macos-preview.sh 接受精确 `main` 源码，或唯一例外的精确 `hotfix/vX.Y.Z` 源码；先验证源码分支、稳定 Tag 基线、双架构 CI、依赖 pin 和当前 `main` 控制面，再 dispatch 受保护 workflow。
 - 受保护 workflow 的唯一职责是 Apple Silicon 与 Intel Ventura 双架构构建、Developer ID 签名、公证、staple、最终校验，并上传不可变 payload artifact 和 stage record。它不创建 Tag、Release 或公开 appcast。
-- 真实 Sparkle UI 升级必须使用该 exact artifact，在公开身份建立前完成。之后由 `main` 上无 Apple 凭据的 publication workflow 创建公开 Pre-release，并逐字节复用同一 artifact；首次创建 Tag 前再次确认 13 个 CDN 固定路径全部返回 404。
+- 真实 Sparkle UI 升级必须使用该 exact artifact，在公开身份建立前完成。之后由 `main` 上无 Apple 凭据的 publication workflow 创建公开 Pre-release，并逐字节复用同一 artifact；首次创建 Tag 前再次确认 `config/release-assets.json` 当前 manifest 定义的 CDN 固定路径（当前 10 个）全部返回 404。
 - 发布身份由 source branch/kind/SHA、Hotfix 稳定基线、main workflow SHA、Run/attempt、artifact ID/digest、asset manifest 和 UI attestation 绑定；不能用“最新 Run”或相同名称的 artifact 猜测来源。
 
 ## 失败、重试与内容变化
@@ -181,7 +181,7 @@ G-MERGE.default=merge
 ## 正式版晋升
 
 - 不存在独立的“发布正式版”构建命令。只有用户明确指定一个已经发布且验证通过的 Pre-release，才可运行 mac-stable-promote.yml。
-- 晋升 Workflow 只能从精确 `origin/main` 运行。晋升前必须按 provenance schema 执行候选身份校验：当前 schema 5 候选须来自 `main` 或合法 `hotfix/vX.Y.Z`，历史 schema 4 候选可来自冻结的 `release-main`；两者都必须核对 Tag Commit、资产数量/大小/GitHub digest、staging Run/attempt、payload artifact 和 Preview stage-record artifact。未知 schema、缺失来源绑定或来源不再可审计时拒绝晋升。
+- 晋升 Workflow 只能从精确 `origin/main` 运行。晋升前必须按 provenance schema 执行候选身份校验：当前 schema 6 候选（兼容 schema 5）须来自 `main` 或合法 `hotfix/vX.Y.Z`，历史 schema 4 候选可来自冻结的 `release-main`；两者都必须核对 Tag Commit、资产数量/大小/GitHub digest、staging Run/attempt、payload artifact 和 Preview stage-record artifact。未知 schema、缺失来源绑定或来源不再可审计时拒绝晋升。
 - 晋升只执行 gh release edit，将同一 Release 标记为非预览并设为 latest；不构建、不签名、不公证、不上传、不移动 Tag。
 - stable latest 由 GitHub `releases/latest` 在每次流程开始和结束时动态读取并校验。基线变更必须通过独立普通 PR 记录，不能由预览发布脚本隐式修改。
 

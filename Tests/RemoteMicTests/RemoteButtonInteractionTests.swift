@@ -12,7 +12,33 @@ struct RemoteButtonInteractionTests {
         .init(settings: .init(doubleClickMilliseconds: d, longPressMilliseconds: l), mode: mode,
               single: .init(action: single, shortcut: nil),
               double: .init(action: double ? .returnKey : .disabled, shortcut: nil),
-              long: .init(action: long ? .arrowRight : .disabled, shortcut: nil))
+              long: .init(action: long ? .arrowRight : .disabled, shortcut: nil),
+              allowsKeyHold: true)
+    }
+
+    @Test func actionChangeClearsOnlyTheDependentOrBrokenHold() {
+        let base = snapshot(.once)
+        #expect(base.shouldClearHold(afterChanging: .singleClick, previousHold: .repeatSingle))
+        #expect(base.shouldClearHold(afterChanging: .singleClick, previousHold: .singleHold))
+        #expect(!base.shouldClearHold(afterChanging: .singleClick, previousHold: .once))
+        #expect(!base.shouldClearHold(afterChanging: .longPress, previousHold: .repeatSingle))
+        #expect(!base.shouldClearHold(afterChanging: .doubleClick, previousHold: .repeatSingle))
+
+        let longConfigured = {
+            var value = snapshot(.once, long: true)
+            value.holdableSingle = value.single
+            value.holdableLong = value.long
+            return value
+        }()
+        #expect(longConfigured.shouldClearHold(afterChanging: .longPress, previousHold: .repeatLong))
+        #expect(longConfigured.shouldClearHold(afterChanging: .longPress, previousHold: .longHold))
+        #expect(!longConfigured.shouldClearHold(afterChanging: .singleClick, previousHold: .repeatLong))
+        #expect(!longConfigured.shouldClearHold(afterChanging: .singleClick, previousHold: .longHold))
+
+        // A stored mode unrelated to the changed trigger still has to be cleared once its
+        // blockers appear; it can no longer run.
+        let broken = snapshot(.repeatSingle, long: true)
+        #expect(broken.shouldClearHold(afterChanging: .doubleClick, previousHold: .repeatSingle))
     }
 
     @Test func doubleWindowStartsAtReleaseAndUsesCapturedTiming() {
@@ -131,6 +157,127 @@ struct RemoteButtonInteractionTests {
         }
     }
 
+    @Test func singleHoldPressesTheClickArrowOnceAndReleasesIt() {
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var begins: [ConfiguredButtonAction] = []
+        var ends: [String] = []
+        var discrete = 0
+        var config = snapshot(.singleHold, single: .arrowRight)
+        config.holdableSingle = config.single
+        #expect(config.isHoldDownActive)
+        controller.handle(.press, button: .right, snapshot: config, valid: { true }, perform: { _, _ in
+            discrete += 1
+            return true
+        }, beginHold: { action in
+            begins.append(action)
+            return true
+        }, endHold: { ends.append($0) })
+        #expect(begins.map(\.action) == [.arrowRight])
+        // 按住由系统负责自动重复，控制器不再补发离散动作。
+        clock.advance(2_000)
+        #expect(begins.count == 1)
+        #expect(discrete == 0)
+        controller.handle(.release, button: .right, snapshot: config, valid: { true },
+                          perform: { _, _ in false })
+        #expect(ends == ["released"])
+        #expect(!controller.isTracking(.right))
+    }
+
+    @Test func longHoldStartsAtTheLongPressThreshold() {
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var begins = 0
+        var discrete = 0
+        var config = snapshot(.longHold, long: true, l: 400)
+        config.holdableLong = config.long
+        func edge(_ phase: RemoteButtonPhase) {
+            controller.handle(phase, button: .left, snapshot: config, valid: { true },
+                              perform: { _, _ in discrete += 1; return true },
+                              beginHold: { _ in begins += 1; return true }, endHold: { _ in })
+        }
+        edge(.press)
+        clock.advance(399)
+        #expect(begins == 0)
+        clock.advance(400)
+        #expect(begins == 1)
+        // 阈值处不执行一次长按动作，而是把它一直按住。
+        #expect(discrete == 0)
+        edge(.release)
+    }
+
+    @Test func cancellingHoldReleasesTheHeldKey() {
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var ends: [String] = []
+        var config = snapshot(.singleHold, single: .arrowDown)
+        config.holdableSingle = config.single
+        controller.handle(.press, button: .left, snapshot: config, valid: { true },
+                          perform: { _, _ in true }, beginHold: { _ in true },
+                          endHold: { ends.append($0) })
+        controller.cancelAll(reason: "environment_changed")
+        #expect(ends == ["environment_changed"])
+    }
+
+    @Test func releasedTapRunsTheActionInsteadOfStartingAHold() {
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var begins = 0
+        var discrete = 0
+        var config = snapshot(.singleHold, single: .arrowLeft)
+        config.double = .init(action: .returnKey, shortcut: nil)
+        config.holdableSingle = config.single
+        controller.handle(.press, button: .left, snapshot: config, valid: { true },
+                          perform: { _, _ in discrete += 1; return true },
+                          beginHold: { _ in begins += 1; return true }, endHold: { _ in })
+        clock.advance(100)
+        // 双击窗口内松手：这是“点一下”，必须发离散动作，不能留下按住的键。
+        controller.handle(.release, button: .left, snapshot: config, valid: { true },
+                          perform: { _, _ in false })
+        clock.advance(1_000)
+        #expect(begins == 0)
+        #expect(discrete == 1)
+    }
+
+    @Test func failedHoldStartCancelsTheInteraction() {
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var config = snapshot(.singleHold, single: .arrowRight)
+        config.holdableSingle = config.single
+        var discrete = 0
+        controller.handle(.press, button: .right, snapshot: config, valid: { true },
+                          perform: { _, _ in discrete += 1; return true },
+                          beginHold: { _ in false }, endHold: { _ in })
+        #expect(!controller.isTracking(.right))
+        clock.advance(1_000)
+        #expect(discrete == 0)
+    }
+
+    @Test func holdChoiceIsASingleStoredMode() throws {
+        let name = "SayAll.HoldExecution.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppSettings(defaults: defaults)
+        settings.setAction(.arrowRight, for: .right, trigger: .singleClick)
+        settings.setAction(.arrowLeft, for: .right, trigger: .longPress)
+        settings.setHoldMode(.singleHold, for: .right)
+        #expect(settings.interactionSnapshot(for: .right).mode == .singleHold)
+        #expect(settings.interactionSnapshot(for: .right).holdDownAction?.action == .arrowRight)
+        // 四个选项互斥：换一个模式会覆盖上一个。
+        settings.setHoldMode(.longHold, for: .right)
+        #expect(settings.interactionSnapshot(for: .right).mode == .longHold)
+        #expect(settings.interactionSnapshot(for: .right).holdDownAction?.action == .arrowLeft)
+        settings.setHoldMode(.repeatLong, for: .right)
+        #expect(settings.interactionSnapshot(for: .right).mode == .repeatLong)
+        #expect(settings.interactionSnapshot(for: .right).holdDownAction == nil)
+        #expect(settings.interactionSettings.modes["right"] == "repeatLong")
+        // Invalid choices from callers cannot enable key hold on other physical buttons.
+        settings.setHoldMode(.singleHold, for: .up)
+        #expect(settings.interactionSettings.mode(for: .up) == .once)
+        settings.interactionSettings.modes["up"] = RemoteButtonHoldMode.longHold.rawValue
+        #expect(settings.interactionSnapshot(for: .up).mode == .once)
+    }
+
     @Test func opaqueSecondaryGesturesRemainRecognizableButCannotRepeat() {
         var config = snapshot()
         config.opaqueLong = true
@@ -148,7 +295,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func timingAndModeMigrationAreIdempotentAndInvalidOverridesStayInactive() throws {
         let name = "SayAll.InteractionMigration.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let legacy = RemoteDeviceProfile(model: .rc003, mappings: .init(
             buttonBindings: AppSettings.defaultBindings, buttonShortcuts: [:], secondaryButtonBindings: [:]))
@@ -215,7 +362,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func changingAnActionClearsAHoldChoiceItCanNoLongerRun() throws {
         let name = "SayAll.HoldConflict.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let profileID = try #require(settings.selectedRemoteProfileID)
@@ -251,7 +398,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func changingTheModelSeedsTheNewModelTimingFromTheLegacyFieldsOnce() throws {
         let name = "SayAll.ModelTiming.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let device = settings.registerBluetoothRemote(identifier: UUID())
@@ -283,7 +430,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func invalidHoldModesAndTimingsAreRejectedOnImportWithoutChangingTheRest() throws {
         let name = "SayAll.InteractionImport.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         settings.setHoldMode(.repeatSingle, for: .back)
@@ -334,7 +481,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func unrecordedShortcutNeverReadsAsABinding() throws {
         let name = "SayAll.UnrecordedShortcut.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let profileID = settings.selectedRemoteProfileID
@@ -358,7 +505,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func timingChangesDoNotCancelButModeAndMappingChangesDo() throws {
         let name = "SayAll.InteractionChanges.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         var cancelled = 0
@@ -375,7 +522,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func timingIsPerModelWhileModesRemainPerDeviceAndBackupRoundTrips() throws {
         let name = "SayAll.Interaction.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let first = settings.registerBluetoothRemote(identifier: UUID())
@@ -429,7 +576,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func unknownModelTimingIsRejectedDuringLoadAndImport() throws {
         let name = "SayAll.Interaction.UnknownModel.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let timing = RemoteButtonGestureTiming(
             doubleClickMilliseconds: 150,
@@ -497,10 +644,78 @@ struct RemoteButtonInteractionTests {
         #expect(result?.longPressMilliseconds == 735)
         #expect(result?.suggestedTiming == .init(
             doubleClickMilliseconds: 250,
-            longPressMilliseconds: 700
+            longPressMilliseconds: 700,
+            repeatSingleStartMilliseconds: 150
         ))
         #expect(result?.suggestedTiming.isValid == true)
         #expect(learner.status.step == .complete)
+    }
+
+    @Test(arguments: [170, 200, 284, 600])
+    func learnedSingleDurationDoesNotBecomeAHoldDuringADoubleClick(singleMilliseconds: Int) throws {
+        var learner = RemoteButtonGestureLearner()
+        learner.start(model: .rc003)
+        for (phase, time): (RemoteButtonPhase, Int) in [
+            (.press, 0), (.release, singleMilliseconds),
+            (.press, 2_000), (.release, 2_080), (.press, 2_250), (.release, 2_330),
+            (.press, 3_000),
+        ] {
+            _ = learner.handle(phase, button: .ok, model: .rc003, timestampMilliseconds: time)
+        }
+        let measured = learner.handle(
+            .release, button: .ok, model: .rc003, timestampMilliseconds: 3_750
+        )
+        let result = try #require(measured)
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var config = snapshot(.repeatSingle, double: true,
+                              d: result.suggestedTiming.doubleClickMilliseconds)
+        config.repeatSingleStartMilliseconds = result.suggestedTiming.repeatSingleStartMilliseconds
+        var events: [ButtonTrigger] = []
+        func edge(_ phase: RemoteButtonPhase, at time: UInt64) {
+            clock.advance(time)
+            controller.handle(phase, button: .ok, snapshot: config, valid: { true }) { trigger, _ in
+                events.append(trigger)
+                return true
+            }
+        }
+        edge(.press, at: 0)
+        edge(.release, at: UInt64(singleMilliseconds))
+        #expect(events.isEmpty)
+        edge(.press, at: UInt64(singleMilliseconds + 170))
+        clock.advance(UInt64(singleMilliseconds + 1_000))
+        #expect(events.isEmpty)
+        edge(.release, at: UInt64(singleMilliseconds + 1_010))
+        #expect(events == [.doubleClick])
+        clock.advance(UInt64(singleMilliseconds + 2_000))
+        #expect(events == [.doubleClick])
+    }
+
+    @Test(arguments: [false, true])
+    func calibratedRepeatStillStartsAndStopsAtTheCapturedThreshold(double: Bool) {
+        let clock = InteractionClock()
+        let controller = RemoteButtonInteractionController(scheduler: clock)
+        var config = snapshot(.repeatSingle, double: double, d: 200)
+        config.repeatSingleStartMilliseconds = 700
+        var events: [ButtonTrigger] = []
+        controller.handle(.press, button: .ok, snapshot: config, valid: { true }) { trigger, _ in
+            events.append(trigger)
+            return true
+        }
+        // 后续设置变化不影响当前按压已捕获的时间。
+        config.repeatSingleStartMilliseconds = 150
+        clock.advance(699)
+        #expect(events.count == (double ? 0 : 1))
+        clock.advance(700)
+        #expect(events.count == (double ? 1 : 2))
+        clock.advance(800)
+        #expect(events.count == (double ? 2 : 3))
+        #expect(events.allSatisfy { $0 == .singleClick })
+        controller.handle(.release, button: .ok, snapshot: config, valid: { true }) { _, _ in false }
+        let count = events.count
+        clock.advance(2_000)
+        #expect(events.count == count)
+        #expect(!controller.isTracking(.ok))
     }
 
     @Test func learningDiscardsImpossibleDoubleClickIntervals() {

@@ -14,8 +14,15 @@ import SayAllChromecast
 #endif
 
 private struct OnboardingInputMethodGuideStep: Identifiable {
+    struct ScreenshotItem: Identifiable {
+        let id: String
+        let resourceName: String
+        let labelKey: String
+    }
+
     enum Content {
         case screenshot(String)
+        case screenshotGroup([ScreenshotItem])
         case instruction(systemImage: String, detailKey: String)
         case systemFunctionKey
     }
@@ -98,6 +105,7 @@ struct OnboardingView: View {
     private let remoteInputDiagnosticOverride: FirstUseRemoteInputDiagnostic?
     private let interactionProbe: OnboardingInteractionProbe?
     private let siriRemotePackageInstalled: Bool
+    private let siriRemoteComponentInstalledOverride: Bool?
     /// 离屏渲染等没有前台会话的宿主显式指定周期权限刷新行为；
     /// `nil` 表示跟随运行期的前后台状态。
     private let permissionRefreshInForegroundOverride: Bool?
@@ -107,6 +115,8 @@ struct OnboardingView: View {
     @State private var inputMonitoringGranted = false
     @State private var accessibilityGranted = false
     @State private var observedRemoteButtons = Set<RemoteButton>()
+    @State private var pendingRemoteButtons = Set<RemoteButton>()
+    @State private var pendingRemoteButtonProfileID: UUID?
     @State private var remoteInputDiagnostic = FirstUseRemoteInputDiagnostic()
     @State private var requestedRemoteConnectionRecovery = false
     @State private var testedControlButtons = Set<RemoteButton>()
@@ -173,6 +183,7 @@ struct OnboardingView: View {
         remoteInputDiagnosticOverride: FirstUseRemoteInputDiagnostic? = nil,
         interactionProbe: OnboardingInteractionProbe? = nil,
         siriRemotePackageInstalledOverride: Bool? = nil,
+        siriRemoteComponentInstalledOverride: Bool? = nil,
         permissionRefreshInForegroundOverride: Bool? = nil,
         initialPhoneAppInstalled: Bool = false
     ) {
@@ -188,6 +199,7 @@ struct OnboardingView: View {
         self.permissionRefreshInForegroundOverride = permissionRefreshInForegroundOverride
         siriRemotePackageInstalled = siriRemotePackageInstalledOverride ??
             OnboardingBuildCapabilities.isSiriRemotePackageInstalled()
+        self.siriRemoteComponentInstalledOverride = siriRemoteComponentInstalledOverride
         _voiceToolAvailability = State(
             initialValue: voiceToolAvailabilityOverride ?? Self.detectVoiceToolAvailability()
         )
@@ -205,6 +217,14 @@ struct OnboardingView: View {
     }
 
     var body: some View {
+        onboardingBody
+    }
+
+    private var onboardingBody: some View {
+        onboardingModelEvents
+    }
+
+    private var onboardingFrame: some View {
         VStack(spacing: 0) {
             phaseHeader
             GeometryReader { proxy in
@@ -215,58 +235,70 @@ struct OnboardingView: View {
                 }
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
-        .environment(\.locale, localization.locale)
-        .frame(minWidth: 980, minHeight: 732)
-        // 引导图缩略图固定 220pt 高，竖版截图（如微信输入法菜单）只剩几十 pt 宽。
-        // 放大层盖住整窗，点击遮罩或右上角关闭按钮退出。
-        .overlay {
-            if let zoomedGuideImageResourceName {
-                onboardingGuideImageZoomOverlay(resourceName: zoomedGuideImageResourceName)
+    }
+
+    private var onboardingStyledLayout: some View {
+        onboardingFrame
+            .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
+            .environment(\.locale, localization.locale)
+            .frame(minWidth: 980, minHeight: 732)
+            // 引导图缩略图固定 220pt 高，竖版截图（如微信输入法菜单）只剩几十 pt 宽。
+            // 放大层盖住整窗，点击遮罩或右上角关闭按钮退出。
+            .overlay {
+                if let zoomedGuideImageResourceName {
+                    onboardingGuideImageZoomOverlay(resourceName: zoomedGuideImageResourceName)
+                }
             }
-        }
-        .onChange(of: zoomedGuideImageResourceName) { resourceName in
-            interactionProbe?.recordState("guide.screenshot.zoom", resourceName)
-        }
-        .sheet(isPresented: $isMembershipPresented) {
-            VStack(alignment: .trailing, spacing: 12) {
-                Button(localization.text("common.action.close")) { isMembershipPresented = false }
-                // 会员中心是按整页设计的（内部 GeometryReader 以可用宽度推算内容宽度，
-                // 可用宽度不足 48pt 时内容宽度会被算成 0）。sheet 不给尺寸时它会塌缩成
-                // 一个只有「关闭」按钮的空弹窗，用户因此无法开通会员。这里给足尺寸。
-                // 上界取 900 + 两侧 padding，保持小于窗口最小宽度 980，避免窗口缩小时
-                // sheet 溢出窗口、把位于最右侧的「关闭」按钮推到窗口之外。
-                membershipFeature.settingsView()
-                    .frame(minWidth: 900, minHeight: 620)
-            }.padding(20)
-        }
-        .onAppear {
-            settings.beginOnboardingSiriRemoteTrial()
-            AppLogger.shared.write(
-                "ONBOARDING SIRI_REMOTE phase=availability installed=\(siriRemotePackageInstalled) " +
-                    "available=\(availableControlSources.contains(.siriRemote))"
-            )
-            refreshPermissionStates()
-            refreshVoiceToolAvailability()
-            prepareForStep(settings.onboardingStep)
-            refreshSecureInputState()
-        }
-        .onReceive(permissionRefreshTimer) { _ in
-            // 权限查询要同步访问 tccd；App 在后台时没有任何用户可见收益，
-            // 用户从系统设置改完权限回到前台时 didBecomeActive 会立即刷新一次。
-            if shouldRefreshPermissionStates {
+            .onChange(of: zoomedGuideImageResourceName) { resourceName in
+                interactionProbe?.recordState("guide.screenshot.zoom", resourceName)
+            }
+            .sheet(isPresented: $isMembershipPresented) {
+                VStack(alignment: .trailing, spacing: 12) {
+                    Button(localization.text("common.action.close")) { isMembershipPresented = false }
+                    // 会员中心是按整页设计的（内部 GeometryReader 以可用宽度推算内容宽度，
+                    // 可用宽度不足 48pt 时内容宽度会被算成 0）。sheet 不给尺寸时它会塌缩成
+                    // 一个只有「关闭」按钮的空弹窗，用户因此无法开通会员。这里给足尺寸。
+                    // 上界取 900 + 两侧 padding，保持小于窗口最小宽度 980，避免窗口缩小时
+                    // sheet 溢出窗口、把位于最右侧的「关闭」按钮推到窗口之外。
+                    membershipFeature.settingsView()
+                        .frame(minWidth: 900, minHeight: 620)
+                }.padding(20)
+            }
+    }
+
+    private var onboardingLifecycleEvents: some View {
+        onboardingStyledLayout
+            .onAppear {
+                settings.beginOnboardingSiriRemoteTrial()
+                AppLogger.shared.write(
+                    "ONBOARDING SIRI_REMOTE phase=availability installed=\(siriRemotePackageInstalled) " +
+                        "available=\(availableControlSources.contains(.siriRemote))"
+                )
                 refreshPermissionStates()
+                refreshVoiceToolAvailability()
+                prepareForStep(settings.onboardingStep)
+                refreshSecureInputState()
             }
-        }
-        .onReceive(runtimeRefreshTimer) { _ in
-            refreshSecureInputState()
-            if settings.onboardingStep == .voiceTool {
-                refreshSystemFunctionKeyUsage()
+            .onReceive(permissionRefreshTimer) { _ in
+                // 权限查询要同步访问 tccd；App 在后台时没有任何用户可见收益，
+                // 用户从系统设置改完权限回到前台时 didBecomeActive 会立即刷新一次。
+                if shouldRefreshPermissionStates {
+                    refreshPermissionStates()
+                }
             }
-            if settings.onboardingStep == .voiceTest {
-                refreshSelectedVoiceToolRuntimeState()
+            .onReceive(runtimeRefreshTimer) { _ in
+                refreshSecureInputState()
+                if settings.onboardingStep == .voiceTool {
+                    refreshSystemFunctionKeyUsage()
+                }
+                if settings.onboardingStep == .voiceTest {
+                    refreshSelectedVoiceToolRuntimeState()
+                }
             }
-        }
+    }
+
+    private var onboardingNotificationEvents: some View {
+        onboardingLifecycleEvents
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshPermissionStates()
             switch settings.onboardingStep {
@@ -294,9 +326,20 @@ struct OnboardingView: View {
                   request.source == "vokie" else { return }
             refreshVoiceToolAvailability()
         }
+    }
+
+    private var onboardingModelEvents: some View {
+        onboardingNotificationEvents
         .onReceive(model.$isConnected.removeDuplicates()) { isConnected in
             guard isConnected else { return }
             routeConnectedPhysicalRemoteIfNeeded()
+        }
+        .onReceive(model.$connectedRemoteProfileIDs.removeDuplicates()) { _ in
+            selectSelectedXiaomiProfileIfNeeded()
+        }
+        .onChange(of: settings.remoteDeviceProfiles) { _ in
+            reconcilePendingRemoteButtons()
+            selectSelectedXiaomiProfileIfNeeded()
         }
         .onReceive(model.$activeRemoteButtons) { buttons in
             guard settings.onboardingControlMethod == .physicalRemote,
@@ -310,8 +353,12 @@ struct OnboardingView: View {
             }
         }
         .onReceive(model.$lastRemoteButtonPress.compactMap { $0 }) { button in
-            guard settings.onboardingControlMethod == .physicalRemote,
-                  selectedPhysicalRemoteProfileMatchesSource else { return }
+            guard settings.onboardingControlMethod == .physicalRemote else { return }
+            if settings.onboardingControlSource == .xiaomiRemote {
+                handleXiaomiRemoteButton(button)
+                return
+            }
+            guard selectedPhysicalRemoteProfileMatchesSource else { return }
             if settings.onboardingStep == .remote {
                 recordRemoteControlButtons(Set([button]), source: "physical_remote")
                 recoverRemoteConnectionIfNeeded()
@@ -488,16 +535,8 @@ struct OnboardingView: View {
             .scrollIndicators(.hidden)
 
             HStack(alignment: .center, spacing: 16) {
-                if settings.onboardingStep == .welcome {
-                    onboardingActionButton(id: "welcome.copy-ai-prompt") {
-                        copyAIAssistantPrompt()
-                    } label: {
-                        Text(verbatim: localization.text(aiPromptCopyStatusKey))
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                }
+                // 内置 AI 配置提示词尚未在外部 AI 工具中可靠完成任务，先隐藏入口。
+                // 无屏配置命令和提示词文案保留，待提示词验收通过后再恢复。
                 if settings.onboardingStep == .voiceTool && !canContinue {
                     Text(verbatim: localization.text("onboarding.voice_tool.guide.continue_hint"))
                         .font(.system(size: 12))
@@ -734,7 +773,7 @@ struct OnboardingView: View {
     }
 
     private var remoteAvailabilityContent: some View {
-        let compact = availablePhysicalControlSources.count > 1
+        let compact = availablePhysicalControlCards.count > 1
         let physicalColumns = [GridItem(.flexible())]
         return VStack(alignment: .leading, spacing: compact ? 10 : 16) {
             onboardingTitle("onboarding.control_source.title")
@@ -743,25 +782,23 @@ struct OnboardingView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text(verbatim: localization.text("onboarding.control_source.hardware"))
-                .font(.system(size: 13, weight: .semibold))
+            HStack(spacing: 8) {
+                Text(verbatim: localization.text("onboarding.control_source.hardware"))
+                    .font(.system(size: 13, weight: .semibold))
+                Text(verbatim: localization.text("onboarding.control_source.recommended"))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+            }
 
             LazyVGrid(
                 columns: physicalColumns,
                 spacing: compact ? 8 : 10
             ) {
-                ForEach(availablePhysicalControlSources) { source in
-                    if source == .siriRemote {
-                        ForEach(OnboardingAppleRemoteGeneration.allCases) { generation in
-                            controlSourceCard(
-                                source,
-                                emphasized: true,
-                                appleGeneration: generation
-                            )
-                        }
-                    } else {
-                        controlSourceCard(source, emphasized: true)
-                    }
+                ForEach(availablePhysicalControlCards) { card in
+                    physicalRemoteCard(card, compact: compact)
                 }
             }
 
@@ -809,9 +846,138 @@ struct OnboardingView: View {
         OnboardingControlSourceVisibilityPolicy.visibleSources(availableControlSources)
     }
 
+    private var availablePhysicalControlCards: [OnboardingPhysicalRemoteCard] {
+        OnboardingPhysicalRemoteCard.ordered(availableSources: visibleControlSources)
+    }
+
     private var availablePhysicalControlSources: [OnboardingControlSource] {
         visibleControlSources.filter {
             [.xiaomiRemote, .siriRemote].contains($0)
+        }
+    }
+
+    private func physicalRemoteCard(
+        _ card: OnboardingPhysicalRemoteCard,
+        compact: Bool
+    ) -> some View {
+        let actionID = "control-source.\(card.id)"
+        let isSelected: Bool
+        switch card {
+        case let .xiaomi(model):
+            isSelected = settings.onboardingControlSource == .xiaomiRemote &&
+                settings.onboardingXiaomiRemoteModel == model
+        case let .apple(generation):
+            isSelected = settings.onboardingControlSource == .siriRemote &&
+                settings.onboardingAppleRemoteGeneration == generation
+        }
+        return onboardingActionButton(id: actionID) {
+            switch card {
+            case let .xiaomi(model):
+                selectXiaomiRemote(model)
+            case let .apple(generation):
+                selectAppleRemote(generation)
+            }
+        } label: {
+            HStack(alignment: .center, spacing: 11) {
+                physicalCardThumbnail(card, compact: compact)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(localization.text(physicalCardTitleKey(card)))
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(1)
+                    Text(localization.text(physicalCardDetailKey(card)))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(compact ? 2 : 3)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: isSelected
+                    ? "checkmark.circle.fill"
+                    : "circle")
+                    .foregroundStyle(isSelected
+                        ? Color.accentColor
+                        : Color.secondary)
+            }
+            .padding(compact ? 10 : 12)
+            .frame(
+                maxWidth: .infinity,
+                minHeight: compact ? 84 : 96,
+                alignment: .center
+            )
+            .background(
+                isSelected
+                    ? Color.accentColor.opacity(0.09)
+                    : Color.primary.opacity(0.04),
+                in: RoundedRectangle(cornerRadius: 12)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(
+                        isSelected
+                            ? Color.accentColor.opacity(0.65)
+                            : Color.primary.opacity(0.08),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func physicalCardTitleKey(_ card: OnboardingPhysicalRemoteCard) -> String {
+        switch card {
+        case let .xiaomi(model): return model.titleKey
+        case let .apple(generation): return generation.titleKey
+        }
+    }
+
+    private func physicalCardDetailKey(_ card: OnboardingPhysicalRemoteCard) -> String {
+        switch card {
+        case let .xiaomi(model): return model.detailKey
+        case .apple: return OnboardingControlSource.siriRemote.detailKey
+        }
+    }
+
+    @ViewBuilder
+    private func physicalCardThumbnail(
+        _ card: OnboardingPhysicalRemoteCard,
+        compact: Bool
+    ) -> some View {
+        switch card {
+        case let .xiaomi(model):
+            let photoKind = OnboardingRemotePhotoKind.resolve(
+                source: .xiaomiRemote,
+                selectedModel: nil,
+                onboardingXiaomiModel: model
+            )
+            if case let .bundled(resourceName) = photoKind,
+               let image = bundledRemoteImage(resourceName: resourceName) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: compact ? 36 : 42, height: compact ? 60 : 72)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                Image(systemName: "appletvremote.gen4.fill")
+                    .font(.system(size: compact ? 19 : 21, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: compact ? 34 : 40, height: compact ? 34 : 40)
+                    .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+            }
+        case .apple:
+            #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
+            SiriRemoteConnectionPhoto()
+                .scaleEffect(compact ? 0.32 : 0.38)
+                .frame(width: compact ? 36 : 42, height: compact ? 60 : 72)
+                .clipped()
+            #else
+            Image(systemName: "appletvremote.gen4.fill")
+                .font(.system(size: compact ? 19 : 21, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: compact ? 34 : 40, height: compact ? 34 : 40)
+                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+            #endif
         }
     }
 
@@ -847,11 +1013,6 @@ struct OnboardingView: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .layoutPriority(1)
-                    if source == .xiaomiRemote {
-                        Text(verbatim: localization.text("onboarding.control_source.recommended"))
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                    }
                     Text(localization.text(source.detailKey))
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
@@ -900,7 +1061,13 @@ struct OnboardingView: View {
     ) -> some View {
         switch source {
         case .xiaomiRemote:
-            if let image = bundledRemoteImage(resourceName: "RC003-remote-photo") {
+            let photoKind = OnboardingRemotePhotoKind.resolve(
+                source: .xiaomiRemote,
+                selectedModel: settings.selectedRemoteProfile?.model,
+                onboardingXiaomiModel: settings.onboardingXiaomiRemoteModel
+            )
+            if case let .bundled(resourceName) = photoKind,
+               let image = bundledRemoteImage(resourceName: resourceName) {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
@@ -1202,6 +1369,8 @@ struct OnboardingView: View {
                 switch steps[selectedIndex].content {
                 case let .screenshot(resourceName):
                     onboardingGuideScreenshot(resourceName: resourceName)
+                case let .screenshotGroup(items):
+                    onboardingGuideScreenshotGroup(items)
                 case let .instruction(systemImage, detailKey):
                     onboardingGuideInstruction(systemImage: systemImage, detailKey: detailKey)
                 case .systemFunctionKey:
@@ -1262,16 +1431,38 @@ struct OnboardingView: View {
         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private func onboardingGuideScreenshot(resourceName: String) -> some View {
+    private func onboardingGuideScreenshotGroup(
+        _ items: [OnboardingInputMethodGuideStep.ScreenshotItem]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(items) { item in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(localization.text(item.labelKey))
+                        .font(.system(size: 12, weight: .semibold))
+                    onboardingGuideScreenshot(
+                        resourceName: item.resourceName,
+                        actionID: "guide.screenshot.zoom.\(item.id)",
+                        maxHeight: 180
+                    )
+                }
+            }
+        }
+    }
+
+    private func onboardingGuideScreenshot(
+        resourceName: String,
+        actionID: String = "guide.screenshot.zoom",
+        maxHeight: CGFloat = 220
+    ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             if let image = onboardingGuideImage(resourceName: resourceName) {
-                onboardingActionButton(id: "guide.screenshot.zoom") {
+                onboardingActionButton(id: actionID) {
                     zoomedGuideImageResourceName = resourceName
                 } label: {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: 220)
+                        .frame(maxWidth: .infinity, maxHeight: maxHeight)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay {
                             RoundedRectangle(cornerRadius: 10)
@@ -1611,18 +1802,8 @@ struct OnboardingView: View {
                 icon: selectedControlConnected
                     ? "checkmark.circle.fill"
                     : "dot.radiowaves.left.and.right",
-                title: !selectedControlConnected && !observedRemoteButtons.isEmpty
-                    ? localization.text("onboarding.remote.hid_connected")
-                    : selectedControlConnected
-                        ? localization.text("onboarding.remote.connected")
-                        : localization.text("onboarding.remote.searching"),
-                detail: localization.text(
-                    selectedControlConnected
-                        ? "onboarding.remote.connected_detail"
-                        : !observedRemoteButtons.isEmpty
-                            ? "onboarding.remote.hid_connected_detail"
-                            : "onboarding.remote.searching_detail"
-                ),
+                title: physicalRemoteConnectionTitle,
+                detail: physicalRemoteConnectionDetail,
                 isComplete: selectedControlConnected,
                 compact: true
             )
@@ -1654,6 +1835,54 @@ struct OnboardingView: View {
                 openBluetoothSettingsButton
             }
         }
+    }
+
+    private var physicalRemoteConnectionTitle: String {
+        if selectedControlConnected {
+            if let name = selectedXiaomiModelDisplayName {
+                return LocalizedMessage(
+                    "onboarding.control_source.connected_model",
+                    arguments: [name]
+                ).text(using: localization)
+            }
+            return localization.text("onboarding.remote.connected")
+        }
+        if !pendingRemoteButtons.isEmpty, let name = selectedXiaomiModelDisplayName {
+            return LocalizedMessage(
+                "onboarding.control_source.identifying_model",
+                arguments: [name]
+            ).text(using: localization)
+        }
+        if !observedRemoteButtons.isEmpty {
+            return localization.text("onboarding.remote.hid_connected")
+        }
+        if let name = selectedXiaomiModelDisplayName {
+            return LocalizedMessage(
+                "onboarding.control_source.searching_model",
+                arguments: [name]
+            ).text(using: localization)
+        }
+        return localization.text("onboarding.remote.searching")
+    }
+
+    private var physicalRemoteConnectionDetail: String {
+        if selectedControlConnected {
+            return localization.text("onboarding.remote.connected_detail")
+        }
+        if !pendingRemoteButtons.isEmpty {
+            return localization.text("onboarding.control_source.identifying_model_detail")
+        }
+        if !observedRemoteButtons.isEmpty {
+            return localization.text("onboarding.remote.hid_connected_detail")
+        }
+        return localization.text("onboarding.remote.searching_detail")
+    }
+
+    private var selectedXiaomiModelDisplayName: String? {
+        guard settings.onboardingControlSource == .xiaomiRemote,
+              let model = settings.onboardingXiaomiRemoteModel
+        else { return nil }
+        return localization.text(model.titleKey)
     }
 
     private var physicalRemoteButtonStatusDetail: String {
@@ -2654,7 +2883,8 @@ struct OnboardingView: View {
     private var onboardingRemotePhoto: some View {
         switch OnboardingRemotePhotoKind.resolve(
             source: settings.onboardingControlSource,
-            selectedModel: settings.selectedRemoteProfile?.model
+            selectedModel: settings.selectedRemoteProfile?.model,
+            onboardingXiaomiModel: settings.onboardingXiaomiRemoteModel
         ) {
         case let .bundled(resourceName):
             if let image = bundledRemoteImage(resourceName: resourceName) {
@@ -2890,23 +3120,13 @@ struct OnboardingView: View {
             sidePanel(titleKey: "onboarding.side.audio") {
                 sideCheck("onboarding.side.device_found", isComplete: !supportedAudioDevices.isEmpty)
                 sideCheck("onboarding.side.device_selected", isComplete: audioOutputSelected)
-                sideCheck(
-                    settings.onboardingControlMethod.usesOnDemandAudioOutput
-                        ? "onboarding.side.audio_on_demand"
-                        : "onboarding.side.audio_ready",
-                    isComplete: onboardingAudioReady
-                )
+                sideCheck(audioSideCheckKey, isComplete: onboardingAudioReady)
             }
         case .voiceTest:
             sidePanel(titleKey: "onboarding.side.voice_test") {
                 sideCheck("onboarding.side.voice_key", isComplete: voiceSessionStarted && voiceSessionEnded)
                 sideCheck("onboarding.side.samples", isComplete: voiceSamplesReceived)
-                sideCheck(
-                    settings.onboardingControlMethod.usesOnDemandAudioOutput
-                        ? "onboarding.side.audio_on_demand"
-                        : "onboarding.side.audio_ready",
-                    isComplete: onboardingAudioReady
-                )
+                sideCheck(audioSideCheckKey, isComplete: onboardingAudioReady)
                 sideCheck("onboarding.side.transcript", isComplete: verifiedTranscriptionAppeared)
             }
         case .controls:
@@ -3195,6 +3415,7 @@ struct OnboardingView: View {
             voiceTool: settings.onboardingVoiceTool,
             remoteAvailability: settings.onboardingRemoteAvailability,
             controlMethod: settings.onboardingControlMethod,
+            controlSource: settings.onboardingControlSource,
             voiceKeyMode: settings.voiceKeyMode,
             capabilities: capabilities,
             phoneAppInstallConfirmed: didConfirmPhoneAppInstalled
@@ -3205,7 +3426,11 @@ struct OnboardingView: View {
                 selectedVoiceToolRuntimeReady
         }
         if settings.onboardingStep == .remoteAvailability {
-            return visibleControlSources.contains(settings.onboardingControlSource)
+            return visibleControlSources.contains(settings.onboardingControlSource) &&
+                OnboardingControlSourceSelectionPolicy.isComplete(
+                    source: settings.onboardingControlSource,
+                    xiaomiModel: settings.onboardingXiaomiRemoteModel
+                )
         }
         return policyAllowsContinue &&
             (settings.onboardingStep != .voiceTool ||
@@ -3272,15 +3497,20 @@ struct OnboardingView: View {
     }
 
     private var diagnosticContext: FirstUseDiagnosticContext {
-        FirstUseDiagnosticContext(
+        let isSiriRemoteSource = settings.onboardingControlSource == .siriRemote
+        let componentInstalled = siriRemoteComponentInstalledOverride
+            ?? model.isSiriRemoteHelperInstalled
+        return FirstUseDiagnosticContext(
             step: settings.onboardingStep,
             remoteAvailability: settings.onboardingRemoteAvailability,
             controlMethod: settings.onboardingControlMethod,
+            controlSource: settings.onboardingControlSource,
             capabilities: capabilities,
             hasSelectedAudioUID: !settings.selectedAudioDeviceUID.isEmpty,
             voiceAttempt: settings.onboardingStep == .voiceTest ? voiceAttempt : nil,
             remoteInput: remoteInputDiagnostic,
-            voiceAuthorizationRequired: settings.onboardingControlSource == .siriRemote &&
+            voiceComponentMissing: isSiriRemoteSource && !componentInstalled,
+            voiceAuthorizationRequired: isSiriRemoteSource && componentInstalled &&
                 settings.siriRemoteNeedsUserAction
         )
     }
@@ -3315,9 +3545,28 @@ struct OnboardingView: View {
         )
     }
 
+    /// 当前来源的语音音频是否在按下语音键时才建立。Siri Remote 与小屏来源都是这样，
+    /// 只是它们分属不同控制方式，必须同时看来源。
+    private var usesOnDemandAudioOutput: Bool {
+        OnboardingAudioReadinessPolicy.usesOnDemandAudioOutput(
+            controlMethod: settings.onboardingControlMethod,
+            controlSource: settings.onboardingControlSource
+        )
+    }
+
+    private var audioSideCheckKey: String {
+        usesOnDemandAudioOutput
+            ? "onboarding.side.audio_on_demand"
+            : "onboarding.side.audio_ready"
+    }
+
     private var onboardingAudioReady: Bool {
-        audioOutputSelected &&
-            (settings.onboardingControlMethod.usesOnDemandAudioOutput || model.isAudioOutputReady)
+        OnboardingAudioReadinessPolicy.isSatisfied(
+            controlMethod: settings.onboardingControlMethod,
+            controlSource: settings.onboardingControlSource,
+            audioOutputSelected: audioOutputSelected,
+            audioReady: model.isAudioOutputReady
+        )
     }
 
     private var selectedAudioDeviceTitle: String {
@@ -3334,9 +3583,13 @@ struct OnboardingView: View {
         guard audioOutputSelected else {
             return localization.text("onboarding.audio.select_detail")
         }
-        if settings.onboardingControlMethod.usesOnDemandAudioOutput,
-           !model.isAudioOutputReady {
-            return localization.text("onboarding.audio.on_demand_detail")
+        if usesOnDemandAudioOutput, !model.isAudioOutputReady {
+            // 下一页的动作不同：手机是「开始手机语音」，Siri Remote 是「按住遥控器语音键」。
+            return localization.text(
+                settings.onboardingControlMethod.usesOnDemandAudioOutput
+                    ? "onboarding.audio.on_demand_detail"
+                    : "onboarding.audio.on_demand_detail_remote"
+            )
         }
         return model.audioStatus.text(using: localization)
     }
@@ -3364,7 +3617,8 @@ struct OnboardingView: View {
             return OnboardingFlowPolicy.isPhysicalRemoteRecognized(
                 at: settings.onboardingStep,
                 voiceConnectionReady: model.isOnboardingControlSourceConnected(
-                    settings.onboardingControlSource
+                    settings.onboardingControlSource,
+                    xiaomiModel: settings.onboardingXiaomiRemoteModel
                 ),
                 validatedHIDButtonObserved: !observedRemoteButtons.isEmpty
             )
@@ -3455,6 +3709,11 @@ struct OnboardingView: View {
 
     private func copyAIAssistantPrompt() {
         let prompt = OnboardingAIAssistantPrompt.text(for: localization.locale)
+        guard !prompt.isEmpty else {
+            aiPromptCopyResult = false
+            AppLogger.shared.write("ONBOARDING AI_PROMPT copied=false reason=resource_missing")
+            return
+        }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         let copied = pasteboard.setString(prompt, forType: .string)
@@ -3615,7 +3874,8 @@ struct OnboardingView: View {
 
     private var inlineVoiceRecoveryReason: FirstUseFailureReason? {
         switch failureReason {
-        case .voiceAuthorizationRequired, .voiceNoSamples, .voiceAudioDeliveryFailed:
+        case .voiceComponentMissing, .voiceAuthorizationRequired,
+             .voiceNoSamples, .voiceAudioDeliveryFailed:
             return failureReason
         default:
             return nil
@@ -3791,8 +4051,19 @@ struct OnboardingView: View {
             ),
             OnboardingInputMethodGuideStep(
                 id: 4,
-                titleKey: "onboarding.voice_tool.guide.release_wechat_fn",
-                content: .screenshot("weixin-app-shortcuts")
+                titleKey: "onboarding.voice_tool.guide.release_wechat_feishu_fn",
+                content: .screenshotGroup([
+                    .init(
+                        id: "wechat",
+                        resourceName: "weixin-app-shortcuts",
+                        labelKey: "onboarding.voice_tool.guide.screenshot.wechat_app"
+                    ),
+                    .init(
+                        id: "feishu",
+                        resourceName: "feishu-settings-remove-shortcuts",
+                        labelKey: "onboarding.voice_tool.guide.screenshot.feishu_app"
+                    ),
+                ])
             ),
         ]
     }
@@ -3918,9 +4189,15 @@ struct OnboardingView: View {
         voiceToolRuntimeState[tool] = OnboardingInputSourceSwitcher.runtimeState(for: tool)
     }
 
+    private func selectXiaomiRemote(_ model: OnboardingXiaomiRemoteModel) {
+        settings.setOnboardingXiaomiRemoteModel(model)
+        selectControlSource(.xiaomiRemote)
+    }
+
     private func selectControlSource(_ source: OnboardingControlSource) {
         if source != .siriRemote {
             settings.setOnboardingAppleRemoteGeneration(nil)
+            model.endSiriRemoteOnboardingTrialIfNeeded()
         }
         settings.setOnboardingControlSource(source)
         showAlternativeControlSources = availableAlternativeControlSources.contains(source)
@@ -3930,6 +4207,8 @@ struct OnboardingView: View {
             settings.setOnboardingPreferredGesture(nil)
         }
         observedRemoteButtons.removeAll()
+        pendingRemoteButtons.removeAll()
+        pendingRemoteButtonProfileID = nil
         remoteInputDiagnostic = FirstUseRemoteInputDiagnostic()
         testedControlButtons.removeAll()
         secureInputActive = nil
@@ -4156,8 +4435,56 @@ struct OnboardingView: View {
         }
     }
 
+    private func reconcileOnboardingXiaomiModel() {
+        guard settings.onboardingControlSource == .xiaomiRemote,
+              settings.onboardingXiaomiRemoteModel == nil
+        else { return }
+        if let inferred = inferredOnboardingXiaomiModel() {
+            settings.setOnboardingXiaomiRemoteModel(inferred, source: "runtime_inferred")
+        }
+    }
+
+    private func selectSelectedXiaomiProfileIfNeeded() {
+        guard settings.onboardingControlSource == .xiaomiRemote,
+              let selectedModel = settings.onboardingXiaomiRemoteModel,
+              let profileID = model.profileID(forXiaomiModel: selectedModel),
+              model.isRemoteConnected(profileID),
+              settings.selectedRemoteProfileID != profileID
+        else { return }
+        model.selectRemoteProfile(profileID)
+        AppLogger.shared.write(
+            "ONBOARDING XIAOMI_CONNECT model=\(selectedModel.rawValue) " +
+                "result=profile_selected_after_ready"
+        )
+    }
+
+    private func inferredOnboardingXiaomiModel() -> OnboardingXiaomiRemoteModel? {
+        if let selectedModel = settings.selectedRemoteProfile?.model {
+            switch selectedModel {
+            case .rc001: return .rc001
+            case .rc003: return .rc003
+            default: break
+            }
+        }
+        let connected = model.connectedOnboardingXiaomiModels
+        if connected.count == 1 {
+            return connected.first
+        }
+        return nil
+    }
+
     private func prepareForStep(_ step: OnboardingStep) {
         refreshPermissionStates()
+        if settings.onboardingControlSource == .xiaomiRemote {
+            reconcileOnboardingXiaomiModel()
+            let stepsRequiringModel: Set<OnboardingStep> = [
+                .permissions, .remote, .audio, .voiceTool, .voiceTest, .controls, .complete,
+            ]
+            if settings.onboardingXiaomiRemoteModel == nil, stepsRequiringModel.contains(step) {
+                settings.setOnboardingStep(.remoteAvailability)
+                return
+            }
+        }
         if settings.onboardingControlSource == .chromecastRemote {
             selectControlSource(.unselected)
             settings.setOnboardingStep(.remoteAvailability)
@@ -4192,6 +4519,8 @@ struct OnboardingView: View {
             routeConnectedPhysicalRemoteIfNeeded()
         case .remote:
             observedRemoteButtons.removeAll()
+            pendingRemoteButtons.removeAll()
+            pendingRemoteButtonProfileID = nil
             remoteInputDiagnostic = remoteInputDiagnosticOverride ?? FirstUseRemoteInputDiagnostic()
             requestedRemoteConnectionRecovery = false
             secureInputWaitStartedAtUptime = nil
@@ -4227,8 +4556,14 @@ struct OnboardingView: View {
     private func recordFailureTransition(_ failure: FirstUseFailureReason?) {
         if settings.onboardingStep == .voiceTest {
             guard failure != lastRecordedFailure else { return }
-            if failure == .voiceAuthorizationRequired {
+            if failure == .voiceAuthorizationRequired || failure == .voiceComponentMissing {
                 settings.recordFirstUseEvent(.blocked, step: .voiceTest, failureReason: failure)
+            }
+            if failure == .voiceComponentMissing {
+                model.logSiriRemoteComponentState(
+                    trigger: "onboarding_voice_test",
+                    force: true
+                )
             }
             // 清除等待标志只表示用户已重试；音频 ready 和真实语音结果由各自链路记录。
             lastRecordedFailure = failure
@@ -4271,6 +4606,9 @@ struct OnboardingView: View {
             }
         }
         switch failure {
+        case .voiceComponentMissing:
+            model.installSiriRemoteComponentForOnboarding()
+            resetVoiceTestForRetry()
         case .bluetoothPermissionDenied:
             requestBluetoothPermission()
         case .inputMonitoringPermissionDenied:
@@ -4307,6 +4645,7 @@ struct OnboardingView: View {
                 voiceTool: settings.onboardingVoiceTool,
                 remoteAvailability: settings.onboardingRemoteAvailability,
                 controlMethod: settings.onboardingControlMethod,
+                controlSource: settings.onboardingControlSource,
                 capabilities: capabilities,
                 hasSelectedAudioUID: !settings.selectedAudioDeviceUID.isEmpty
             ) else { return }
@@ -4720,13 +5059,15 @@ struct OnboardingView: View {
             events: settings.firstUseEvents,
             appLanguage: localization.locale.identifier,
             controlSource: settings.onboardingControlSource,
+            siriRemoteComponent: model.siriRemoteComponentDiagnosticState,
             voiceBinding: settings.stagedVoiceToolBinding ?? settings.verifiedVoiceToolBinding
         )
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(snapshot.redactedText, forType: .string)
         AppLogger.shared.write(
             "ONBOARDING DIAGNOSTICS copied step=\(settings.onboardingStep.rawValue) " +
-                "failure=\(failureReason?.rawValue ?? "none")"
+                "failure=\(failureReason?.rawValue ?? "none") " +
+                "siri_remote_component_installed=\(model.siriRemoteComponentDiagnosticState.isInstalled)"
         )
         AppLogger.shared.writeDiagnosticSummary(
             snapshot.redactedText,
@@ -4772,11 +5113,96 @@ struct OnboardingView: View {
         )
     }
 
+    private func handleXiaomiRemoteButton(_ button: RemoteButton) {
+        guard let selectedModel = settings.onboardingXiaomiRemoteModel else { return }
+        let profileID = model.lastRemoteButtonPressProfileID
+        let profileModel = profileID.flatMap { profileID in
+            settings.remoteDeviceProfiles.first { $0.id == profileID }?.model
+        }
+        let disposition = OnboardingXiaomiEventPolicy.disposition(
+            profileModel: profileModel,
+            selectedModel: selectedModel,
+            controlSource: settings.onboardingControlSource
+        )
+        switch disposition {
+        case .accept:
+            guard let profileID,
+                  profileID == model.profileID(forXiaomiModel: selectedModel)
+            else { return }
+            recordConfirmedXiaomiRemoteButton(button)
+        case .pendingIdentity:
+            if pendingRemoteButtonProfileID != profileID {
+                pendingRemoteButtons.removeAll()
+            }
+            pendingRemoteButtonProfileID = profileID
+            pendingRemoteButtons.insert(button)
+            AppLogger.shared.write(
+                "ONBOARDING REMOTE_INPUT observed=pending_identity " +
+                    "control_count=\(pendingRemoteButtons.count)"
+            )
+        case .rejectOtherModel:
+            AppLogger.shared.write(
+                "ONBOARDING REMOTE_INPUT ignored=profile_mismatch"
+            )
+        }
+    }
+
+    private func recordConfirmedXiaomiRemoteButton(_ button: RemoteButton) {
+        switch settings.onboardingStep {
+        case .remote:
+            recordRemoteControlButtons(Set([button]), source: "physical_remote")
+            recoverRemoteConnectionIfNeeded()
+        case .controls:
+            testedControlButtons.insert(button)
+        default:
+            break
+        }
+    }
+
+    private func reconcilePendingRemoteButtons() {
+        guard !pendingRemoteButtons.isEmpty,
+              let selectedModel = settings.onboardingXiaomiRemoteModel,
+              let profileID = pendingRemoteButtonProfileID
+        else { return }
+        let profileModel = settings.remoteDeviceProfiles.first { $0.id == profileID }?.model
+        let disposition = OnboardingXiaomiEventPolicy.disposition(
+            profileModel: profileModel,
+            selectedModel: selectedModel,
+            controlSource: settings.onboardingControlSource
+        )
+        switch disposition {
+        case .accept:
+            let confirmed = pendingRemoteButtons
+            pendingRemoteButtons.removeAll()
+            pendingRemoteButtonProfileID = nil
+            recordedPendingButtonsIntoGate(confirmed)
+        case .rejectOtherModel:
+            pendingRemoteButtons.removeAll()
+            pendingRemoteButtonProfileID = nil
+            AppLogger.shared.write(
+                "ONBOARDING REMOTE_INPUT pending=discarded reason=profile_mismatch"
+            )
+        case .pendingIdentity:
+            break
+        }
+    }
+
+    private func recordedPendingButtonsIntoGate(_ buttons: Set<RemoteButton>) {
+        switch settings.onboardingStep {
+        case .remote:
+            recordRemoteControlButtons(buttons, source: "physical_remote")
+            recoverRemoteConnectionIfNeeded()
+        case .controls:
+            testedControlButtons.formUnion(buttons)
+        default:
+            break
+        }
+    }
+
     private func prepareSelectedControlConnection() {
         switch settings.onboardingControlSource {
         case .xiaomiRemote:
-            model.refreshRemoteDiscovery()
-            model.applyHIDSettings()
+            prepareSelectedXiaomiRemoteConnection()
         case .siriRemote:
             model.applyHIDSettings()
         case .chromecastRemote:
@@ -4795,19 +5221,64 @@ struct OnboardingView: View {
         }
     }
 
+    private func prepareSelectedXiaomiRemoteConnection() {
+        guard let selectedModel = settings.onboardingXiaomiRemoteModel else {
+            model.refreshRemoteDiscovery()
+            model.applyHIDSettings()
+            return
+        }
+        if let profileID = model.profileID(forXiaomiModel: selectedModel) {
+            if settings.selectedRemoteProfileID != profileID {
+                model.selectRemoteProfile(profileID)
+            }
+            if !model.isRemoteConnected(profileID) {
+                model.connectRemoteProfile(profileID)
+            }
+            AppLogger.shared.write(
+                "ONBOARDING XIAOMI_CONNECT model=\(selectedModel.rawValue) " +
+                    "result=profile_found"
+            )
+        } else {
+            AppLogger.shared.write(
+                "ONBOARDING XIAOMI_CONNECT model=\(selectedModel.rawValue) " +
+                    "result=discovery_started"
+            )
+        }
+        model.refreshRemoteDiscovery()
+        model.applyHIDSettings()
+    }
+
     private func routeConnectedPhysicalRemoteIfNeeded() {
         let suppressForUserBack = suppressConnectedPhysicalRemoteAutoRouteOnce
         suppressConnectedPhysicalRemoteAutoRouteOnce = false
         guard !suppressForUserBack,
               settings.onboardingStep == .remoteAvailability,
               settings.onboardingControlSource == .unselected,
-              model.isOnboardingControlSourceConnected(.xiaomiRemote) else { return }
+              model.isOnboardingControlSourceConnected(.xiaomiRemote),
+              let connectedModel = preferredConnectedXiaomiModel else { return }
         // Keep the control-device page visible so the user can see and confirm the
         // selected hardware; an existing connection only preselects the card.
+        settings.setOnboardingXiaomiRemoteModel(connectedModel)
         selectControlSource(.xiaomiRemote)
         AppLogger.shared.write(
-            "ONBOARDING CONTROL_SOURCE preselected=xiaomi_remote reason=connected_physical_remote"
+            "ONBOARDING CONTROL_SOURCE preselected=xiaomi_remote " +
+                "model=\(connectedModel.rawValue) reason=connected_physical_remote"
         )
+    }
+
+    private var preferredConnectedXiaomiModel: OnboardingXiaomiRemoteModel? {
+        let connected = model.connectedOnboardingXiaomiModels
+        if let selectedModel = settings.selectedRemoteProfile?.model {
+            switch selectedModel {
+            case .rc001:
+                if connected.contains(.rc001) { return .rc001 }
+            case .rc003:
+                if connected.contains(.rc003) { return .rc003 }
+            default:
+                break
+            }
+        }
+        return OnboardingXiaomiRemoteModel.allCases.first { connected.contains($0) }
     }
 
     private func selectedControlAccepts(_ source: UsageEventSource) -> Bool {
@@ -4823,7 +5294,14 @@ struct OnboardingView: View {
 
     private func selectedControlAcceptsVoice(_ source: UsageEventSource?) -> Bool {
         switch settings.onboardingControlSource {
-        case .xiaomiRemote, .siriRemote, .chromecastRemote:
+        case .xiaomiRemote:
+            guard source == .bluetoothRemote,
+                  model.activePhysicalVoiceControlSource == .xiaomiRemote,
+                  settings.onboardingXiaomiRemoteModel != nil,
+                  let activeProfileID = model.activePhysicalVoiceProfileID
+            else { return false }
+            return activeProfileID == settings.selectedRemoteProfileID
+        case .siriRemote, .chromecastRemote:
             return source == .bluetoothRemote &&
                 (model.activePhysicalVoiceControlSource == settings.onboardingControlSource ||
                     selectedPhysicalRemoteProfileMatchesSource)
@@ -4837,16 +5315,19 @@ struct OnboardingView: View {
     }
 
     private var selectedPhysicalRemoteProfileMatchesSource: Bool {
-        guard let model = settings.selectedRemoteProfile?.model else { return false }
+        guard let profileModel = settings.selectedRemoteProfile?.model else { return false }
         switch settings.onboardingControlSource {
         case .xiaomiRemote:
-            return !model.usesPrivateAdapter
+            guard let selectedModel = settings.onboardingXiaomiRemoteModel else {
+                return !profileModel.usesPrivateAdapter
+            }
+            return profileModel == selectedModel.model
         case .siriRemote:
-            guard model.isAppleSiriRemote else { return false }
+            guard profileModel.isAppleSiriRemote else { return false }
             guard let generation = settings.onboardingAppleRemoteGeneration else { return true }
-            return model == generation.model
+            return profileModel == generation.model
         case .chromecastRemote:
-            return model.isChromecastRemote
+            return profileModel.isChromecastRemote
         case .appleCompanion, .webRemote, .unselected:
             return false
         }

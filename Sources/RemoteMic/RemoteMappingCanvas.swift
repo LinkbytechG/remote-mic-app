@@ -107,16 +107,29 @@ enum RemoteMappingLayout {
     }
 }
 
+/// 卡片动作的来源。只有继承项在窄卡片上加链接图标；显式动作的来源
+/// 在编辑区和悬停帮助里完整呈现，避免图标占用动作名宽度。
+enum RemoteMappingActionSource {
+    case base
+    case inherited
+    case explicit
+    case unavailable
+}
+
 struct RemoteMappingCanvas: View {
     @EnvironmentObject private var localization: LocalizationStore
 
     @Binding var selectedButton: RemoteButton
     let activeButtons: Set<RemoteButton>
     let voiceActive: Bool
+    /// 画布真机图跟随所选型号；目录里没有的型号仍回退 RC003 旧图。
+    var remoteModel: XiaomiRemoteModel? = nil
     let actionSummary: (RemoteButton, ButtonTrigger) -> String
     let holdSummary: (RemoteButton) -> String
     /// 悬停时显示的完整形态（例如 `⌘ Command + ⇧ Shift + H`）；卡片正文用 `actionSummary`。
     var actionDetail: ((RemoteButton, ButtonTrigger) -> String)? = nil
+    /// 方案编辑时的动作来源；继承项在窄卡片上用链接图标标记。
+    var actionSource: ((RemoteButton, ButtonTrigger) -> RemoteMappingActionSource)? = nil
     let onEdit: (RemoteButton, ButtonTrigger) -> Void
     let onEditHold: (RemoteButton) -> Void
     var onVoiceSettings: () -> Void = {}
@@ -127,7 +140,7 @@ struct RemoteMappingCanvas: View {
         GeometryReader { geometry in
             let metrics = Metrics(width: geometry.size.width)
             ZStack {
-                MappingRemotePhoto()
+                MappingRemotePhoto(model: remoteModel)
                     .frame(
                         width: RemoteMappingLayout.remoteSize.width,
                         height: RemoteMappingLayout.remoteSize.height
@@ -279,10 +292,23 @@ struct RemoteMappingCanvas: View {
                             Text(trigger.displayName(using: localization))
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
-                            Text(actionSummary(button, trigger))
-                                .font(.system(size: 12, weight: trigger == .singleClick ? .semibold : .regular))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
+                            HStack(spacing: 2) {
+                                if actionSource?(button, trigger) == .inherited {
+                                    Image(systemName: "link")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                        .accessibilityLabel(
+                                            Text(localization.text("button_mapping.binding.inherited"))
+                                        )
+                                }
+                                Text(actionSummary(button, trigger))
+                                    .font(.system(
+                                        size: 12,
+                                        weight: trigger == .singleClick ? .semibold : .regular
+                                    ))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 5)
@@ -395,19 +421,31 @@ struct RemoteMappingCanvas: View {
 }
 
 private enum MappingRemoteImageResource {
-    static let image: NSImage? = {
-        guard let url = Bundle.main.url(
-            forResource: "RC003-remote-photo",
-            withExtension: "png"
-        ) else { return nil }
-        return NSImage(contentsOf: url)
+    private static let images: [String: NSImage] = {
+        var images: [String: NSImage] = [:]
+        for entry in VoiceRemoteCatalog.entries {
+            guard let url = RemoteMicResourceBundle.mainOrDevelopment.url(
+                forResource: entry.photoResource,
+                withExtension: "png"
+            ), let image = NSImage(contentsOf: url) else { continue }
+            images[entry.photoResource] = image
+        }
+        return images
     }()
+
+    static func image(for model: XiaomiRemoteModel?) -> NSImage? {
+        let resourceName = VoiceRemoteCatalog.photoResource(for: model ?? .rc003)
+            ?? "RC003-remote-photo"
+        return images[resourceName]
+    }
 }
 
 private struct MappingRemotePhoto: View {
+    let model: XiaomiRemoteModel?
+
     var body: some View {
         Group {
-            if let photo = MappingRemoteImageResource.image {
+            if let photo = MappingRemoteImageResource.image(for: model) {
                 Image(nsImage: photo)
                     .resizable()
                     .aspectRatio(contentMode: .fill)

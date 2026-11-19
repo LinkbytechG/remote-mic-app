@@ -54,6 +54,117 @@ enum HIDReportClock {
     }
 }
 
+enum HIDReportCallbackPath {
+    case manager
+    case device
+    case simulated
+
+    var logName: String {
+        switch self {
+        case .manager: "manager"
+        case .device: "device"
+        case .simulated: "simulated"
+        }
+    }
+}
+
+struct HIDReportDeduplicationKey: Equatable {
+    let devicePointer: UInt
+    let reportID: UInt32
+    let data: Data
+}
+
+/// macOS 27 会同时投递 manager 与 device 两条回调。只要其中一个通道还能工作，
+/// 就必须让同一份物理报告只执行一次。这里按“实际到达的报告”去重，而不是按
+/// “回调是否注册”去重；注册成功但不再投递时，另一条通道仍可继续工作。
+struct HIDReportDeduplicationCache {
+    struct Entry {
+        let key: HIDReportDeduplicationKey
+        let timestampNanoseconds: UInt64
+    }
+
+    static let duplicateWindowNanoseconds: UInt64 = 50_000_000
+    private static let retentionNanoseconds: UInt64 = 250_000_000
+    private static let maximumEntries = 8
+
+    private(set) var entries: [Entry] = []
+
+    mutating func shouldDrop(
+        key: HIDReportDeduplicationKey,
+        timestampNanoseconds: UInt64
+    ) -> Bool {
+        entries.removeAll {
+            Self.distance($0.timestampNanoseconds, timestampNanoseconds) > Self.retentionNanoseconds
+        }
+        if entries.contains(where: {
+            $0.key == key &&
+                Self.distance($0.timestampNanoseconds, timestampNanoseconds) <=
+                    Self.duplicateWindowNanoseconds
+        }) {
+            return true
+        }
+        entries.append(Entry(key: key, timestampNanoseconds: timestampNanoseconds))
+        if entries.count > Self.maximumEntries {
+            entries.removeFirst(entries.count - Self.maximumEntries)
+        }
+        return false
+    }
+
+    private static func distance(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        lhs >= rhs ? lhs - rhs : rhs - lhs
+    }
+}
+
+private func processHIDReportCallback(
+    context: UnsafeMutableRawPointer?,
+    result: IOReturn,
+    sender: UnsafeMutableRawPointer?,
+    reportID: UInt32,
+    report: UnsafeMutablePointer<UInt8>,
+    reportLength: CFIndex,
+    timeStamp: UInt64,
+    path: HIDReportCallbackPath
+) {
+    guard let context else { return }
+    let monitor = Unmanaged<HIDRemoteMonitor>.fromOpaque(context).takeUnretainedValue()
+    guard result == kIOReturnSuccess else {
+        monitor.reportCallbackRejected(
+            reason: "io_error",
+            result: result,
+            reportLength: reportLength,
+            path: path
+        )
+        return
+    }
+    guard let sender else {
+        monitor.reportCallbackRejected(
+            reason: "missing_sender",
+            result: result,
+            reportLength: reportLength,
+            path: path
+        )
+        return
+    }
+    guard reportLength > 0 else {
+        monitor.reportCallbackRejected(
+            reason: "empty_report",
+            result: result,
+            reportLength: reportLength,
+            path: path
+        )
+        return
+    }
+    let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
+    let data = Data(bytes: report, count: reportLength)
+    monitor.handleReport(
+        from: device,
+        reportID: reportID,
+        data: data,
+        timestampNanoseconds: HIDReportClock.uptimeNanoseconds(fromMachTime: timeStamp),
+        path: path
+    )
+}
+
 private func hidInputReportWithTimeStamp(
     context: UnsafeMutableRawPointer?,
     result: IOReturn,
@@ -64,27 +175,37 @@ private func hidInputReportWithTimeStamp(
     reportLength: CFIndex,
     timeStamp: UInt64
 ) {
-    guard let context else { return }
-    let monitor = Unmanaged<HIDRemoteMonitor>.fromOpaque(context).takeUnretainedValue()
-    guard result == kIOReturnSuccess else {
-        monitor.reportCallbackRejected(reason: "io_error", result: result, reportLength: reportLength)
-        return
-    }
-    guard let sender else {
-        monitor.reportCallbackRejected(reason: "missing_sender", result: result, reportLength: reportLength)
-        return
-    }
-    guard reportLength > 0 else {
-        monitor.reportCallbackRejected(reason: "empty_report", result: result, reportLength: reportLength)
-        return
-    }
-    let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
-    let data = Data(bytes: report, count: reportLength)
-    monitor.handleReport(
-        from: device,
+    processHIDReportCallback(
+        context: context,
+        result: result,
+        sender: sender,
         reportID: reportID,
-        data: data,
-        timestampNanoseconds: HIDReportClock.uptimeNanoseconds(fromMachTime: timeStamp)
+        report: report,
+        reportLength: reportLength,
+        timeStamp: timeStamp,
+        path: .manager
+    )
+}
+
+private func hidDeviceInputReportWithTimeStamp(
+    context: UnsafeMutableRawPointer?,
+    result: IOReturn,
+    sender: UnsafeMutableRawPointer?,
+    type: IOHIDReportType,
+    reportID: UInt32,
+    report: UnsafeMutablePointer<UInt8>,
+    reportLength: CFIndex,
+    timeStamp: UInt64
+) {
+    processHIDReportCallback(
+        context: context,
+        result: result,
+        sender: sender,
+        reportID: reportID,
+        report: report,
+        reportLength: reportLength,
+        timeStamp: timeStamp,
+        path: .device
     )
 }
 
@@ -99,6 +220,57 @@ enum HIDDeviceMatchDecision: Equatable {
     case rejected(String)
 }
 
+/// 切换器会话期间的诊断限流。
+///
+/// 会话打开后有两处会跟着定时器节奏产生日志，而且都不封顶：
+///
+/// - 方向键连发每 100ms 成功一次就写一行，且每次成功都会重置 15 秒会话超时，
+///   所以按住不放就是一直写；
+/// - 500ms 的 HUD 状态轮询每 tick 写一行，而它的两个信号本身会在区间内来回跳
+///   （见 `startAppSwitcherLifecycle` 里的注释），单纯去重挡不住。
+///
+/// 这里把两处都收敛成「会话期间只累加计数，收尾时写一行汇总」：连发是同一次会话内的
+/// 重复动作，逐条写没有诊断价值；状态行保留真正的状态变化，并且单次会话封顶。
+struct AppSwitcherDiagnosticPolicy {
+    /// 单次会话最多写多少行状态。切换器正常只在开/关之间变一次，20 行足够覆盖
+    /// 抖动的极端情况，又不会因为信号乱跳而写满整个日志。
+    static let maximumStateLines = 20
+
+    private(set) var repeatCount = 0
+    private(set) var repeatCounts: [String: Int] = [:]
+    private(set) var statePollCount = 0
+    private(set) var stateLineCount = 0
+    private var lastStateSignature: String?
+
+    /// 连发不逐条写日志，只按按钮累加；收尾汇总里给出准确次数与分布。
+    mutating func recordRepeat(button: String) {
+        repeatCount += 1
+        repeatCounts[button, default: 0] += 1
+    }
+
+    /// 按按钮的连发分布，例如 `left:12,right:3`；没有连发时给 `none`。
+    var repeatBreakdown: String {
+        guard !repeatCounts.isEmpty else { return "none" }
+        return repeatCounts.keys.sorted()
+            .map { "\($0):\(repeatCounts[$0] ?? 0)" }
+            .joined(separator: ",")
+    }
+
+    /// 返回这一份状态是否需要写成日志。
+    ///
+    /// `signature` 只应该包含稳定信号（例如「切换器是否可见」），不要把会跳动的
+    /// 前台 App 拼进去，否则去重会退化成每 tick 一行。
+    mutating func recordStatePoll(signature: String) -> Bool {
+        statePollCount += 1
+        guard stateLineCount < Self.maximumStateLines, signature != lastStateSignature else {
+            return false
+        }
+        lastStateSignature = signature
+        stateLineCount += 1
+        return true
+    }
+}
+
 final class HIDRemoteMonitor {
     private let settings: AppSettings
     private let eventSuppressor: KeyboardEventSuppressor
@@ -108,7 +280,27 @@ final class HIDRemoteMonitor {
     private let permissionPoll: HIDPermissionPoll
     private let runtimePermissions: () -> Bool
     private let actionPerformer: (RemoteButton, ButtonTrigger, ConfiguredButtonAction) -> Bool
+    private let holdBeginPerformer: (ConfiguredButtonAction) -> Bool
+    private let holdEndPerformer: (String) -> Void
+    /// 解析该按键当前生效的单击与长按动作：方案覆盖优先，其次基础映射。
+    private let holdTargetResolver:
+        ((UUID?, RemoteButton) -> (single: ConfiguredButtonAction, long: ConfiguredButtonAction)?)?
     private let appSwitcherSession: KeyboardInjector.AppSwitcherSession
+    private let minimizedWindowRestorer: (String?, String?) -> KeyboardInjector.MinimizedWindowRestoreResult
+    private let windowCounter: (pid_t) -> Int?
+    private let windowActivator: (pid_t) -> Bool
+    private let applicationActivator: (pid_t) -> Bool
+    private let appSwitcherSelectedApplication: () -> KeyboardInjector.AppSwitcherSelection?
+    private let appSwitcherHudState: () -> KeyboardInjector.AppSwitcherHudState
+    /// 切换器里当前高亮的 App 标题，用来判断方向键是否真的移动了高亮。
+    private let appSwitcherHighlightedTitle: () -> String?
+    /// Dock 进程当前拥有的窗口数：切换器开着时 Dock 会多一个窗口。
+    private let appSwitcherDockWindowCount: () -> Int
+    /// 注册“切换器被外部关闭”的观察者，返回取消注册的闭包。
+    /// 生产实现监听鼠标点击：用户在切换器开着时点别处会把它关掉，此时必须松开 ⌘。
+    private let appSwitcherDismissObserverInstaller:
+        (@escaping () -> Void) -> (() -> Void)?
+    private let frontmostProcessIdentifier: () -> pid_t?
     private let overrideActionPerformer: (UUID?, RemoteButton, ButtonTrigger) -> Bool
     private let hasOverrideBinding: (UUID?, RemoteButton, ButtonTrigger) -> Bool
     private let frontmostBundleIdentifier: () -> String?
@@ -117,6 +309,8 @@ final class HIDRemoteMonitor {
     private let karabinerElementsInstalled: () -> Bool
     private let prepareNativeKeys: (() -> Bool)?
     private let restoreNativeKeys: () -> Void
+    /// 方向键是否登记事件级兜底；默认按构建架构取值，测试可以显式注入。
+    private let directionalNativeFallback: Bool
     private let targetFingerprint: String?
     private let excludedFingerprints: () -> Set<String>
     private var allowedLocationIDs: Set<UInt32>? {
@@ -126,6 +320,32 @@ final class HIDRemoteMonitor {
     private var manager: IOHIDManager?
     private let reportRunLoop = HIDReportRunLoop()
     private var scheduledReportRunLoop: CFRunLoop?
+    private struct DeviceReportRegistration {
+        let device: IOHIDDevice
+        let buffer: UnsafeMutablePointer<UInt8>
+        let length: CFIndex
+    }
+
+    private var deviceReportCallbackRunLoop: CFRunLoop?
+    private var deviceReportRegistrations: [DeviceReportRegistration] = []
+    private var deviceReportPointers = Set<UInt>()
+    private var retiredDeviceReportBuffers: [
+        (buffer: UnsafeMutablePointer<UInt8>, length: CFIndex)
+    ] = []
+    private let deviceReportLock = NSLock()
+    private let reportDeduplicationLock = NSLock()
+    private var reportDeduplicationCache = HIDReportDeduplicationCache()
+    private var pathHealth = HIDReportPathHealth()
+
+    /// macOS 27 can stop delivering manager-level reports after the native key
+    /// mapping is written. Per-device callbacks provide another path, so keep
+    /// both and deduplicate actual deliveries. Do not drop manager reports only
+    /// because a device callback is registered: registration does not prove
+    /// that the callback is still delivering.
+    private var usesDeviceReportCallback: Bool {
+        if #available(macOS 27, *) { return true }
+        return false
+    }
     private var activeDevice: IOHIDDevice?
     private var probedDevices: [IOHIDDevice] = []
     private(set) var deviceFingerprint: String? {
@@ -186,7 +406,32 @@ final class HIDRemoteMonitor {
     private var appSwitcherTimeout: HIDRemoteScheduledTask?
     private var appSwitcherFrontmostMonitor: HIDRemoteScheduledTask?
     private var appSwitcherConfirmationProbe: HIDRemoteScheduledTask?
+    private var appSwitcherMinimizedRestoreProbe: HIDRemoteScheduledTask?
+    private var appSwitcherModifierWatchdog: HIDRemoteScheduledTask?
+    private var appSwitcherSingleWindowTask: HIDRemoteScheduledTask?
+    private var appSwitcherForegroundTask: HIDRemoteScheduledTask?
+    private var appSwitcherPendingPickerEntry: HIDRemoteScheduledTask?
+    /// 取消注册外部关闭观察者的闭包。
+    private var appSwitcherDismissRemover: (() -> Void)?
+    /// 方向键之后核对高亮是否移动的任务。
+    private var appSwitcherArrowCheck: HIDRemoteScheduledTask?
+    /// 打开切换器之后核对它是否真的出现了的任务。
+    private var appSwitcherOpenProbe: HIDRemoteScheduledTask?
+    /// 本次会话的连发次数与状态行计数，收尾时汇总输出。
+    private var appSwitcherDiagnostics = AppSwitcherDiagnosticPolicy()
+    /// 本次会话里是否确实见过切换器打开（用 Dock 窗口数判断）。
+    private var appSwitcherObservedOpen = false
+    /// 本次会话里用户是否已经用方向键选过东西。
+    private var appSwitcherHasNavigated = false
+    /// 切换器自己关掉后补发的次数上限。
+    private var appSwitcherReopenCount = 0
+    /// 会话开始时 Dock 的窗口数量，用来判断切换器窗口是否还在。
+    private var appSwitcherDockWindowBaseline: Int?
     private var appSwitcherOriginBundleIdentifier: String?
+    /// 切换器 HUD 里高亮的 App（按进程记录，同名双实例也能区分）。
+    private var appSwitcherTargetApplication: KeyboardInjector.AppSwitcherSelection?
+    /// 确认后窗口层可能还开着；下一次按返回键时用它判断要不要补 Escape。
+    private var appSwitcherPendingLayerClose: KeyboardInjector.AppSwitcherSelection?
     private(set) var status = LocalizedMessage("button_mapping.status.disabled")
     var onStatus: ((LocalizedMessage) -> Void)?
     var onActiveButtons: ((UUID?, Set<RemoteButton>) -> Void)?
@@ -196,6 +441,9 @@ final class HIDRemoteMonitor {
     /// 算进相邻边沿的间隔里。
     var onRuntimeButton: ((UUID?, RemoteButton, RemoteButtonPhase, Int) -> Bool)?
     var claimsRuntimeButton: ((UUID?, RemoteButton) -> Bool)?
+    /// 设备已匹配、但原生键映射校验没有通过。绝大多数是 HID 服务尚未枚举出来，
+    /// 重连后重试一次即可；由上层决定重试节奏，监视器本身不排程。
+    var onNativeMappingVerificationFailed: (() -> Void)?
     var onInputReset: ((UUID?) -> Void)?
     var onInternalAction: ((UUID?, ButtonAction) -> Void)?
 
@@ -216,6 +464,10 @@ final class HIDRemoteMonitor {
             ButtonTrigger,
             ConfiguredButtonAction
         ) -> Bool)? = nil,
+        holdBeginPerformer: ((ConfiguredButtonAction) -> Bool)? = nil,
+        holdEndPerformer: ((String) -> Void)? = nil,
+        holdTargetResolver:
+            ((UUID?, RemoteButton) -> (single: ConfiguredButtonAction, long: ConfiguredButtonAction)?)? = nil,
         overrideActionPerformer: @escaping (UUID?, RemoteButton, ButtonTrigger) -> Bool = {
             _, _, _ in false
         },
@@ -232,7 +484,45 @@ final class HIDRemoteMonitor {
         },
         prepareNativeKeys: (() -> Bool)? = nil,
         restoreNativeKeys: @escaping () -> Void = {},
-        appSwitcherKeyStatePoster: @escaping KeyboardInjector.KeyStatePoster = KeyboardInjector.postKeyState
+        directionalNativeFallback: Bool = HIDRemoteMonitor.directionalNativeFallbackEnabled,
+        appSwitcherKeyStatePoster: @escaping KeyboardInjector.KeyStatePoster = KeyboardInjector.postKeyState,
+        minimizedWindowRestorer: @escaping (
+            String?,
+            String?
+        ) -> KeyboardInjector.MinimizedWindowRestoreResult = {
+            KeyboardInjector.restoreMinimizedWindowIfNeeded(
+                frontmostBundleIdentifier: $0,
+                originBundleIdentifier: $1
+            )
+        },
+        windowCounter: @escaping (pid_t) -> Int? = {
+            KeyboardInjector.standardWindowCount(processIdentifier: $0)
+        },
+        windowActivator: @escaping (pid_t) -> Bool = {
+            KeyboardInjector.restoreSingleWindow(processIdentifier: $0)
+        },
+        applicationActivator: @escaping (pid_t) -> Bool = {
+            KeyboardInjector.activateApplication(processIdentifier: $0)
+        },
+        appSwitcherSelectedApplication: @escaping () -> KeyboardInjector.AppSwitcherSelection? = {
+            KeyboardInjector.appSwitcherSelectedApplication()
+        },
+        appSwitcherHudState: @escaping () -> KeyboardInjector.AppSwitcherHudState = {
+            KeyboardInjector.appSwitcherHudState()
+        },
+        appSwitcherHighlightedTitle: @escaping () -> String? = {
+            KeyboardInjector.appSwitcherHighlightedTitle()
+        },
+        appSwitcherDockWindowCount: @escaping () -> Int = {
+            KeyboardInjector.dockWindowCount()
+        },
+        appSwitcherDismissObserverInstaller:
+            @escaping (@escaping () -> Void) -> (() -> Void)? =
+            HIDRemoteMonitor.installMouseClickDismissObserver,
+
+        frontmostProcessIdentifier: @escaping () -> pid_t? = {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier
+        }
     ) {
         self.settings = settings
         self.profileID = profileID
@@ -241,11 +531,31 @@ final class HIDRemoteMonitor {
         self.eventSuppressor = eventSuppressor
         self.ownsEventSuppressor = ownsEventSuppressor
         self.scheduler = scheduler
+        self.minimizedWindowRestorer = minimizedWindowRestorer
+        self.windowCounter = windowCounter
+        self.windowActivator = windowActivator
+        self.applicationActivator = applicationActivator
+        self.appSwitcherSelectedApplication = appSwitcherSelectedApplication
+        self.appSwitcherHudState = appSwitcherHudState
+        self.appSwitcherHighlightedTitle = appSwitcherHighlightedTitle
+        self.appSwitcherDockWindowCount = appSwitcherDockWindowCount
+        self.appSwitcherDismissObserverInstaller = appSwitcherDismissObserverInstaller
+        self.frontmostProcessIdentifier = frontmostProcessIdentifier
         self.permissionPoll = permissionPoll
         self.runtimePermissions = runtimePermissions
         self.appSwitcherSession = KeyboardInjector.AppSwitcherSession(
-            keyStatePoster: appSwitcherKeyStatePoster
+            keyStatePoster: appSwitcherKeyStatePoster,
+            scheduler: { delay, event in
+                scheduler.schedule(
+                    afterMilliseconds: delay,
+                    repeatingEveryMilliseconds: nil,
+                    event
+                )
+            }
         )
+        self.appSwitcherSession.setDiagnosticLogger { message in
+            diagnosticLogger("HID APP SWITCHER EVENT " + message)
+        }
         self.actionPerformer = actionPerformer ?? { _, _, configured in
             KeyboardInjector.send(
                 configured.action,
@@ -255,6 +565,15 @@ final class HIDRemoteMonitor {
                 )
             )
         }
+        self.holdBeginPerformer = holdBeginPerformer ?? { configured in
+            guard KeyboardInjector.isAccessibilityTrusted, let key = configured.holdableKey
+            else { return false }
+            return KeyboardHoldExecution.shared.begin(.init(key))
+        }
+        self.holdEndPerformer = holdEndPerformer ?? { reason in
+            KeyboardHoldExecution.shared.end(reason: reason)
+        }
+        self.holdTargetResolver = holdTargetResolver
         self.overrideActionPerformer = overrideActionPerformer
         self.hasOverrideBinding = hasOverrideBinding
         self.frontmostBundleIdentifier = frontmostBundleIdentifier
@@ -263,6 +582,7 @@ final class HIDRemoteMonitor {
         self.karabinerElementsInstalled = karabinerElementsInstalled
         self.prepareNativeKeys = prepareNativeKeys
         self.restoreNativeKeys = restoreNativeKeys
+        self.directionalNativeFallback = directionalNativeFallback
     }
 
     func assignProfileID(_ profileID: UUID) {
@@ -322,6 +642,12 @@ final class HIDRemoteMonitor {
         if settings.customMappingEnabled {
             let suppressionReady = eventSuppressor.start()
             AppLogger.shared.write("HID FILTER ready=\(suppressionReady)")
+            // 兜底默认值只在编译期按架构决定，自动化里只有 arm64 那份真正跑过测试；
+            // 把生效值写进会话日志，现场不必再靠一次性探针判断这台机器有没有开窗口。
+            AppLogger.shared.write(
+                "HID FILTER directional_fallback="
+                    + (directionalNativeFallback ? "true" : "false")
+            )
         }
 
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -332,6 +658,7 @@ final class HIDRemoteMonitor {
         IOHIDManagerSetDeviceMatching(manager, matching)
 
         let context = Unmanaged.passUnretained(self).toOpaque()
+        let usesDeviceReportCallback = self.usesDeviceReportCallback
         IOHIDManagerRegisterDeviceMatchingCallback(manager, hidDeviceMatched, context)
         IOHIDManagerRegisterDeviceRemovalCallback(manager, hidDeviceRemoved, context)
         IOHIDManagerRegisterInputReportWithTimeStampCallback(
@@ -350,6 +677,9 @@ final class HIDRemoteMonitor {
             dedicatedReportRunLoop == nil
                 ? "HID REPORT runloop mode=main reason=dedicated_thread_unavailable"
                 : "HID REPORT runloop mode=dedicated thread=sayall.hid.reports"
+        )
+        AppLogger.shared.write(
+            "HID REPORT path=\(usesDeviceReportCallback ? "device+manager" : "manager")"
         )
         IOHIDManagerScheduleWithRunLoop(
             manager,
@@ -403,11 +733,14 @@ final class HIDRemoteMonitor {
         // 先结束提前登记会话：共享 suppressor 不会在这里关闭，若不推进代数，
         // 已经在报告线程上读到旧快照的回调仍会写入吞键的陈旧记录。
         prearmSession.end()
+        // 停止监视必须同时抬起任何仍被按住的键，否则它会一直留在系统里。
+        buttonInteractions.cancelAll(reason: "monitor_stopped")
         permissionPollSubscription?.cancel()
         permissionPollSubscription = nil
         resetInputState()
         nativeKeysNeutralized = false
         if ownsEventSuppressor { eventSuppressor.stop() }
+        unregisterAllDeviceReportCallbacks()
         probedDevices.forEach {
             IOHIDDeviceClose($0, IOOptionBits(kIOHIDOptionsTypeNone))
         }
@@ -428,7 +761,145 @@ final class HIDRemoteMonitor {
             self.manager = nil
         }
         scheduledReportRunLoop = nil
-        reportRunLoop.stop()
+        if reportRunLoop.stop() {
+            releaseRetiredDeviceReportBuffers()
+        }
+    }
+
+    deinit {
+        if reportRunLoop.stop(waitTimeout: 0.5) {
+            releaseRetiredDeviceReportBuffers()
+        }
+    }
+
+    private static func deviceReportPointer(_ device: IOHIDDevice) -> UInt {
+        UInt(bitPattern: Unmanaged.passUnretained(device).toOpaque())
+    }
+
+    /// macOS 27 needs a per-device callback because the manager-level callback
+    /// stops delivering after the native key mapping is written. The manager
+    /// callback remains registered for devices that cannot be opened directly.
+    private func registerDeviceReportCallbackIfNeeded(_ device: IOHIDDevice) {
+        guard usesDeviceReportCallback else { return }
+        let pointer = Self.deviceReportPointer(device)
+        deviceReportLock.lock()
+        guard !deviceReportPointers.contains(pointer) else {
+            deviceReportLock.unlock()
+            return
+        }
+        deviceReportPointers.insert(pointer)
+        let runLoop = deviceReportCallbackRunLoop
+            ?? scheduledReportRunLoop
+            ?? RunLoop.main.getCFRunLoop()
+        deviceReportCallbackRunLoop = runLoop
+        let maxLength = (IOHIDDeviceGetProperty(
+            device,
+            kIOHIDMaxInputReportSizeKey as CFString
+        ) as? NSNumber)?.intValue ?? 4_096
+        let length = CFIndex(max(64, maxLength))
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(length))
+        buffer.initialize(repeating: 0, count: Int(length))
+        IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+            device,
+            buffer,
+            length,
+            hidDeviceInputReportWithTimeStamp,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+        IOHIDDeviceScheduleWithRunLoop(
+            device,
+            runLoop,
+            CFRunLoopMode.commonModes.rawValue
+        )
+        deviceReportRegistrations.append(
+            DeviceReportRegistration(device: device, buffer: buffer, length: length)
+        )
+        deviceReportLock.unlock()
+        diagnosticLogger("HID REPORT device_callback registered path=device")
+    }
+
+    @discardableResult
+    private func unregisterDeviceReportCallback(_ device: IOHIDDevice) -> Bool {
+        let pointer = Self.deviceReportPointer(device)
+        deviceReportLock.lock()
+        guard let index = deviceReportRegistrations.firstIndex(where: {
+            Self.deviceReportPointer($0.device) == pointer
+        }) else {
+            deviceReportLock.unlock()
+            return false
+        }
+        let registration = deviceReportRegistrations[index]
+        deviceReportLock.unlock()
+        IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+            registration.device,
+            registration.buffer,
+            registration.length,
+            nil,
+            nil
+        )
+        if let runLoop = deviceReportCallbackRunLoop {
+            IOHIDDeviceUnscheduleFromRunLoop(
+                registration.device,
+                runLoop,
+                CFRunLoopMode.commonModes.rawValue
+            )
+        }
+        deviceReportLock.lock()
+        if let currentIndex = deviceReportRegistrations.firstIndex(where: {
+            Self.deviceReportPointer($0.device) == pointer
+        }) {
+            let current = deviceReportRegistrations.remove(at: currentIndex)
+            deviceReportPointers.remove(pointer)
+            // The report thread may still be inside a callback. Keep the
+            // buffer alive until the run loop has stopped.
+            retiredDeviceReportBuffers.append((current.buffer, current.length))
+        }
+        deviceReportLock.unlock()
+        return true
+    }
+
+    private func unregisterAllDeviceReportCallbacks() {
+        deviceReportLock.lock()
+        let registrations = deviceReportRegistrations
+        deviceReportRegistrations.removeAll()
+        deviceReportLock.unlock()
+        for registration in registrations {
+            IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+                registration.device,
+                registration.buffer,
+                registration.length,
+                nil,
+                nil
+            )
+            if let runLoop = deviceReportCallbackRunLoop {
+                IOHIDDeviceUnscheduleFromRunLoop(
+                    registration.device,
+                    runLoop,
+                    CFRunLoopMode.commonModes.rawValue
+                )
+            }
+        }
+        // Keep the device pointers until callbacks are unregistered so a
+        // manager report in flight during shutdown cannot run a second time.
+        deviceReportLock.lock()
+        for registration in registrations {
+            let pointer = Self.deviceReportPointer(registration.device)
+            deviceReportPointers.remove(pointer)
+            retiredDeviceReportBuffers.append((registration.buffer, registration.length))
+        }
+        deviceReportLock.unlock()
+        deviceReportCallbackRunLoop = nil
+    }
+
+    private func releaseRetiredDeviceReportBuffers() {
+        deviceReportLock.lock()
+        let buffers = retiredDeviceReportBuffers
+        retiredDeviceReportBuffers.removeAll()
+        deviceReportLock.unlock()
+        for entry in buffers {
+            entry.buffer.deinitialize(count: Int(entry.length))
+            entry.buffer.deallocate()
+        }
     }
 
     /// 设备匹配回调在 HID 报告线程上执行，设置、界面和状态必须回到主线程。
@@ -504,6 +975,7 @@ final class HIDRemoteMonitor {
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             return
         }
+        registerDeviceReportCallbackIfNeeded(device)
         probedDevices.append(device)
         diagnosticLogger("HID DEVICE probing mode=monitored")
     }
@@ -515,6 +987,7 @@ final class HIDRemoteMonitor {
         guard prepareNativeKeyMapping() else { return false }
         let selectedDevice = probedDevices.remove(at: selectedIndex)
         probedDevices.forEach {
+            unregisterDeviceReportCallback($0)
             IOHIDDeviceClose($0, IOOptionBits(kIOHIDOptionsTypeNone))
         }
         probedDevices.removeAll()
@@ -545,6 +1018,7 @@ final class HIDRemoteMonitor {
                 IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
                 return false
             }
+            registerDeviceReportCallbackIfNeeded(device)
             activeDevice = device
             deviceFingerprint = fingerprint
             activeDeviceIsSeized = true
@@ -580,6 +1054,9 @@ final class HIDRemoteMonitor {
                 IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             }
             return false
+        }
+        if monitorResult == kIOReturnSuccess {
+            registerDeviceReportCallbackIfNeeded(device)
         }
         activeDevice = device
         deviceFingerprint = fingerprint
@@ -631,6 +1108,7 @@ final class HIDRemoteMonitor {
 
     private func deviceDidRemoveOnMain(device: IOHIDDevice) {
         if let activeDevice, CFEqual(activeDevice, device) {
+            unregisterDeviceReportCallback(activeDevice)
             IOHIDDeviceClose(activeDevice, IOOptionBits(kIOHIDOptionsTypeNone))
             self.activeDevice = nil
             deviceFingerprint = nil
@@ -645,6 +1123,7 @@ final class HIDRemoteMonitor {
             return
         }
         let probedDevice = probedDevices.remove(at: probeIndex)
+        unregisterDeviceReportCallback(probedDevice)
         IOHIDDeviceClose(probedDevice, IOOptionBits(kIOHIDOptionsTypeNone))
         diagnosticLogger("HID DEVICE probe_removed")
     }
@@ -653,13 +1132,38 @@ final class HIDRemoteMonitor {
         from device: IOHIDDevice,
         reportID: UInt32,
         data: Data,
-        timestampNanoseconds: UInt64? = nil
+        timestampNanoseconds: UInt64? = nil,
+        path: HIDReportCallbackPath
     ) {
+        // macOS 27 同时投递 manager 与 device 回调。按实际到达的报告去重：
+        // 注册成功但不再投递的通道不能阻止另一条通道继续工作。
+        let reportUptime = timestampNanoseconds ?? monotonicNow()
+        let diagnosticsNow = monotonicNow()
+        let devicePointer = Self.deviceReportPointer(device)
+        deviceReportLock.lock()
+        let hasDeviceCallback = deviceReportPointers.contains(devicePointer)
+        deviceReportLock.unlock()
+        // 只有已经为这个设备注册 device 回调的 monitor 才需要双路径去重和健康诊断。
+        // 其他 monitor 只走 manager 通道，不能把它们误报成 device_silent。
+        if path != .simulated, hasDeviceCallback {
+            let key = HIDReportDeduplicationKey(
+                devicePointer: devicePointer,
+                reportID: reportID,
+                data: data
+            )
+            reportDeduplicationLock.lock()
+            let duplicate = reportDeduplicationCache.shouldDrop(
+                key: key,
+                timestampNanoseconds: diagnosticsNow
+            )
+            reportDeduplicationLock.unlock()
+            recordPathReport(path: path, duplicate: duplicate, nowNanoseconds: diagnosticsNow)
+            if duplicate { return }
+        }
         // 登记必须在本线程立刻完成：系统原生音量事件可能早于主线程处理报告。
         prearmManagedNativeEvents(from: device, reportID: reportID, data: data)
         // 报告时刻在进入主线程之前定下来：主线程一旦排队，处理时刻就不再代表
         // 用户真正按下或松开的时间。
-        let reportUptime = timestampNanoseconds ?? monotonicNow()
         let retained = Unmanaged.passRetained(device)
         DispatchQueue.main.async { [weak self] in
             guard let self else {
@@ -670,8 +1174,77 @@ final class HIDRemoteMonitor {
                 from: retained.takeRetainedValue(),
                 reportID: reportID,
                 data: data,
-                timestampNanoseconds: reportUptime
+                timestampNanoseconds: reportUptime,
+                path: path
             )
+        }
+    }
+
+    private func recordPathReport(
+        path: HIDReportCallbackPath,
+        duplicate: Bool,
+        nowNanoseconds: UInt64
+    ) {
+        let events = pathHealth.record(
+            path: path,
+            duplicate: duplicate,
+            nowNanoseconds: nowNanoseconds,
+            recoveryEnabled: usesDeviceReportCallback
+        )
+        for event in events {
+            switch event {
+            case .deviceDeliveryConfirmed:
+                diagnosticLogger("HID REPORT PATH device_delivery=confirmed")
+            case .deviceDeliveryRecovered:
+                diagnosticLogger("HID REPORT PATH device_delivery=recovered")
+            case .managerFallback:
+                diagnosticLogger("HID REPORT PATH fallback=manager reason=device_silent")
+            case let .window(window):
+                diagnosticLogger(
+                    "HID REPORT PATH WINDOW window_ms=\(window.windowMilliseconds) " +
+                        "device_reports=\(window.deviceReports) " +
+                        "manager_reports=\(window.managerReports) " +
+                        "duplicates=\(window.duplicateReports) " +
+                        "manager_fallback=\(window.fallbackReports) " +
+                        "device_healthy=\(window.deviceHealthy)"
+                )
+            case let .recoveryCandidate(attempt, managerReports):
+                diagnosticLogger(
+                    "HID REPORT PATH watchdog result=candidate reason=device_silent " +
+                        "attempt=\(attempt) manager_reports=\(managerReports)"
+                )
+                requestDeviceCallbackRecovery()
+            case let .recoveryExhausted(attempts):
+                diagnosticLogger(
+                    "HID REPORT PATH watchdog result=exhausted reason=device_silent " +
+                        "attempts=\(attempts)"
+                )
+            }
+        }
+    }
+
+    /// manager 仍在投递、device 连续两个窗口没有投递时，重挂一次 device 回调。
+    /// 退避与尝试上限由 `HIDReportPathHealth` 维护；即使重挂失败，manager 通道仍会继续处理报告。
+    private func requestDeviceCallbackRecovery() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.usesDeviceReportCallback, let device = self.activeDevice else {
+                self?.diagnosticLogger(
+                    "HID REPORT PATH watchdog result=unavailable reason=no_active_device"
+                )
+                return
+            }
+            let removed = self.unregisterDeviceReportCallback(device)
+            self.deviceReportCallbackRunLoop = nil
+            if removed {
+                self.registerDeviceReportCallbackIfNeeded(device)
+                self.diagnosticLogger(
+                    "HID REPORT PATH watchdog result=callback_reregistered reason=device_silent"
+                )
+            } else {
+                self.diagnosticLogger(
+                    "HID REPORT PATH watchdog result=skipped reason=registration_missing"
+                )
+            }
         }
     }
 
@@ -692,7 +1265,12 @@ final class HIDRemoteMonitor {
         var events = Set<RemoteNativeEvent>()
         for usage in usages {
             guard let button = RemoteButton.usageMap[usage],
-                  button == .volumeUp || button == .volumeDown || button == .tv else { continue }
+                  Self.prearmsNativeEvent(
+                      for: button,
+                      seized: routing.deviceSeized,
+                      neutralized: routing.nativeKeysNeutralized,
+                      directionalFallback: directionalNativeFallback
+                  ) else { continue }
             events.formUnion(button.nativeEvents)
         }
         guard !events.isEmpty else { return }
@@ -727,6 +1305,42 @@ final class HIDRemoteMonitor {
         !seized || !neutralized
     }
 
+    /// 方向键是否启用事件级兜底。
+    ///
+    /// Intel 现场已证实「映射回读通过 ≠ 系统停止投递」（音量键 227 次、方向键双跳），
+    /// 而 Apple Silicon 上从未观察到该泄漏。方向键的原生码与实体键盘完全同码，
+    /// 在没有泄漏的机器上登记只会开出会吞掉实体键盘方向键的窗口（甚至吞掉 keyUp
+    /// 导致系统认为键仍按下），因此默认只在 Intel 构建启用。
+    /// 若将来在 Apple Silicon 上拿到同样的泄漏日志，把这个默认值改成 true 即可。
+    static let directionalNativeFallbackEnabled: Bool = {
+        #if arch(x86_64)
+        return true
+        #else
+        return false
+        #endif
+    }()
+
+    /// 报告线程可以提前登记的原生事件。
+    ///
+    /// TV 与音量始终由 App 执行，判据与外层 `needsEventLevelArm` 一致。
+    /// 方向键不同：monitored 且源头映射未生效时，默认左右动作故意走原生透传，
+    /// 原生事件本身就是那一次移动；此时提前登记会把它吞掉，按键完全没有反应。
+    /// 因此方向键要求「非独占 + 映射已回读生效 + 本构建启用了方向键兜底」，
+    /// 这正是 Intel 上原生方向键比主线程登记早到约 200 ms、单次按下移动两格的现场条件。
+    ///
+    /// 判据自带完整答案（不依赖调用点的粗筛），因此可以直接单测。
+    static func prearmsNativeEvent(
+        for button: RemoteButton,
+        seized: Bool,
+        neutralized: Bool,
+        directionalFallback: Bool
+    ) -> Bool {
+        if button == .tv || button == .volumeUp || button == .volumeDown {
+            return Self.needsEventLevelArm(seized: seized, neutralized: neutralized)
+        }
+        return button.isDirectional && directionalFallback && !seized && neutralized
+    }
+
     /// 由主线程在启用状态、允许位置、目标设备或排除列表变化时刷新，
     /// 供报告线程只读使用。会话未开启时是空操作，不会留下陈旧快照。
     private func refreshPrearmRouting() {
@@ -751,14 +1365,15 @@ final class HIDRemoteMonitor {
         from device: IOHIDDevice,
         reportID: UInt32,
         data: Data,
-        timestampNanoseconds: UInt64
+        timestampNanoseconds: UInt64,
+        path: HIDReportCallbackPath
     ) {
         guard manager != nil else {
-            diagnosticLogger("HID REPORT rejected reason=monitor_inactive")
+            diagnosticLogger("HID REPORT rejected reason=monitor_inactive path=\(path.logName)")
             return
         }
         guard settings.customMappingEnabled || backOnlyMode else {
-            diagnosticLogger("HID REPORT rejected reason=mapping_disabled")
+            diagnosticLogger("HID REPORT rejected reason=mapping_disabled path=\(path.logName)")
             return
         }
         guard Self.isLocationAllowed(
@@ -769,7 +1384,7 @@ final class HIDRemoteMonitor {
                 "HID REPORT rejected reason=unsafe_location " +
                     "report_id=\(reportID) bytes=\(data.count) " +
                     "has_location=\(Self.locationID(for: device) != nil) " +
-                    "allowlist_configured=\(allowedLocationIDs != nil)"
+                    "allowlist_configured=\(allowedLocationIDs != nil) path=\(path.logName)"
             )
             return
         }
@@ -784,18 +1399,24 @@ final class HIDRemoteMonitor {
         case let .accepted(value):
             fingerprint = value
         case let .rejected(reason):
-            diagnosticLogger("HID REPORT rejected reason=\(reason)")
+            diagnosticLogger("HID REPORT rejected reason=\(reason) path=\(path.logName)")
             return
         }
         let discoveryUsages: Set<UInt16>?
         if deviceFingerprint == nil, targetFingerprint == nil {
-            guard let usages = parsedUsages(reportID: reportID, data: data, source: "device") else {
+            guard let usages = parsedUsages(
+                reportID: reportID,
+                data: data,
+                source: "device",
+                path: path
+            ) else {
                 return
             }
             guard Self.shouldPromoteDiscoveryReport(usages: usages) else {
                 diagnosticLogger(
                     "HID REPORT deferred reason=discovery_no_known_button source=device " +
-                        "id=\(reportID) bytes=\(data.count) usage_count=\(usages.count)"
+                        "id=\(reportID) bytes=\(data.count) usage_count=\(usages.count) " +
+                        "path=\(path.logName)"
                 )
                 return
             }
@@ -810,13 +1431,17 @@ final class HIDRemoteMonitor {
                     fingerprint: fingerprint,
                     allowManagerFallback: true
                 ) else {
-                    diagnosticLogger("HID REPORT rejected reason=device_activation_failed")
+                    diagnosticLogger(
+                        "HID REPORT rejected reason=device_activation_failed path=\(path.logName)"
+                    )
                     return
                 }
             }
         }
         guard runtimePermissionsAreValid() else {
-            diagnosticLogger("HID REPORT rejected reason=runtime_permission_revoked")
+            diagnosticLogger(
+                "HID REPORT rejected reason=runtime_permission_revoked path=\(path.logName)"
+            )
             releaseForRevokedPermissions()
             return
         }
@@ -826,14 +1451,16 @@ final class HIDRemoteMonitor {
                 data: data,
                 source: "device",
                 usages: discoveryUsages,
-                timestampNanoseconds: timestampNanoseconds
+                timestampNanoseconds: timestampNanoseconds,
+                path: path
             )
         } else {
             parseAndProcess(
                 reportID: reportID,
                 data: data,
                 source: "device",
-                timestampNanoseconds: timestampNanoseconds
+                timestampNanoseconds: timestampNanoseconds,
+                path: path
             )
         }
     }
@@ -841,11 +1468,12 @@ final class HIDRemoteMonitor {
     fileprivate func reportCallbackRejected(
         reason: String,
         result: IOReturn,
-        reportLength: CFIndex
+        reportLength: CFIndex,
+        path: HIDReportCallbackPath
     ) {
         diagnosticLogger(
             "HID REPORT callback_rejected reason=\(reason) result=\(result) " +
-                "bytes=\(max(0, reportLength))"
+                "bytes=\(max(0, reportLength)) path=\(path.logName)"
         )
     }
 
@@ -875,18 +1503,24 @@ final class HIDRemoteMonitor {
         timestampNanoseconds: UInt64?
     ) {
         guard settings.customMappingEnabled || backOnlyMode else {
-            diagnosticLogger("HID REPORT rejected reason=mapping_disabled source=simulated")
+            diagnosticLogger(
+                "HID REPORT rejected reason=mapping_disabled source=simulated path=simulated"
+            )
             return
         }
         guard runtimePermissionsAreValid() else {
-            diagnosticLogger("HID REPORT rejected reason=runtime_permission_revoked source=simulated")
+            diagnosticLogger(
+                "HID REPORT rejected reason=runtime_permission_revoked " +
+                    "source=simulated path=simulated"
+            )
             return
         }
         parseAndProcess(
             reportID: reportID,
             data: data,
             source: "simulated",
-            timestampNanoseconds: timestampNanoseconds ?? monotonicNow()
+            timestampNanoseconds: timestampNanoseconds ?? monotonicNow(),
+            path: .simulated
         )
     }
 
@@ -901,9 +1535,15 @@ final class HIDRemoteMonitor {
         reportID: UInt32,
         data: Data,
         source: String,
-        timestampNanoseconds: UInt64
+        timestampNanoseconds: UInt64,
+        path: HIDReportCallbackPath
     ) {
-        guard let usages = parsedUsages(reportID: reportID, data: data, source: source) else {
+        guard let usages = parsedUsages(
+            reportID: reportID,
+            data: data,
+            source: source,
+            path: path
+        ) else {
             return
         }
         processParsedReport(
@@ -911,15 +1551,21 @@ final class HIDRemoteMonitor {
             data: data,
             source: source,
             usages: usages,
-            timestampNanoseconds: timestampNanoseconds
+            timestampNanoseconds: timestampNanoseconds,
+            path: path
         )
     }
 
-    private func parsedUsages(reportID: UInt32, data: Data, source: String) -> Set<UInt16>? {
+    private func parsedUsages(
+        reportID: UInt32,
+        data: Data,
+        source: String,
+        path: HIDReportCallbackPath
+    ) -> Set<UInt16>? {
         guard let usages = RemoteHIDReportParser.usages(reportID: reportID, data: data) else {
             diagnosticLogger(
                 "HID REPORT rejected reason=parse_failed source=\(source) " +
-                    "id=\(reportID) bytes=\(data.count)"
+                    "id=\(reportID) bytes=\(data.count) path=\(path.logName)"
             )
             return nil
         }
@@ -931,7 +1577,8 @@ final class HIDRemoteMonitor {
         data: Data,
         source: String,
         usages: Set<UInt16>,
-        timestampNanoseconds: UInt64
+        timestampNanoseconds: UInt64,
+        path: HIDReportCallbackPath
     ) {
         // TV and volume are always managed, unlike intentional left/right passthrough.
         // Register before diagnostics, UI callbacks and configuration lookups.
@@ -945,7 +1592,8 @@ final class HIDRemoteMonitor {
         }
         diagnosticLogger(
             "HID REPORT accepted source=\(source) id=\(reportID) bytes=\(data.count) " +
-                "usage_count=\(usages.count) buttons=\(Self.buttonList(for: usages))"
+                "usage_count=\(usages.count) buttons=\(Self.buttonList(for: usages)) " +
+                "path=\(path.logName)"
         )
         if backOnlyMode {
             processBackOnly(usages: usages.intersection([RemoteButton.back.hidUsage]))
@@ -977,6 +1625,17 @@ final class HIDRemoteMonitor {
                 "HID EDGE pressed=\(Self.buttonList(for: pressed)) " +
                     "released=\(Self.buttonList(for: released))" + timing
             )
+        }
+        // Only classify the two documented remote voice usages. General key
+        // contents and report bytes never enter this diagnostic.
+        for (usage, kind) in [(UInt16(0x3E), "f5"), (UInt16(0x0C), "letter_i")] {
+            if pressed.contains(usage) || released.contains(usage) {
+                diagnosticLogger(
+                    "HID VOICE_USAGE source_kind=\(kind) " +
+                        "edge=\(pressed.contains(usage) ? "down" : "up") " +
+                        "phase=observed correlation=timing_only system_fn_delivery=unknown"
+                )
+            }
         }
         activeUsages = usages
         onActiveButtons?(profileID, RemoteButton.buttons(for: usages))
@@ -1021,7 +1680,9 @@ final class HIDRemoteMonitor {
             // Seizing one HID interface does not guarantee that sibling interfaces
             // stop emitting native events. Every managed press owns its native
             // descriptors; intentional passthrough and marked host events remain free.
-            if !usesNativePassthrough, shouldArmNativeEvent(for: button), button != .volumeUp, button != .volumeDown, button != .tv {
+            if !usesNativePassthrough,
+               shouldArmNativeEvent(for: button) || preflightAction == .appSwitcher,
+               button != .volumeUp, button != .volumeDown, button != .tv {
                 eventSuppressor.arm(button: button, edge: .down)
             }
             var shouldPerformAction = true
@@ -1059,8 +1720,21 @@ final class HIDRemoteMonitor {
                 profileID: profileID
             ).action != .disabled || hasOverrideBinding(profileID, button, .longPress)
             let action = settings.action(for: button, profileID: profileID)
+            if button == .back, handlePendingLayerCloseBack() {
+                continue
+            }
+            if button == .up || button == .down, handlePendingLayerCloseArrow(button: button) {
+                continue
+            }
+            // 会话中，绑定了切换器动作的按键等价于菜单键（Tab）；其余吞掉。
+            let sessionTabAllowed = action == .appSwitcher
+                && !recognizesDoubleClick && !recognizesLongPress
             if appSwitcherSession.isActive,
-               handleAppSwitcherControlPress(button) {
+               handleAppSwitcherControlPress(
+                   button,
+                   usage: usage,
+                   swallowsOthers: !sessionTabAllowed
+               ) {
                 continue
             }
             if appSwitcherSession.isActive, button == .tv {
@@ -1130,13 +1804,19 @@ final class HIDRemoteMonitor {
                         snapshot.hasSameBinding(as: self.interactionSnapshot(button: button, profileID: profileID))
                 }, perform: { [weak self] trigger, configured in
                     self?.performConfiguredAction(for: button, trigger: trigger, captured: configured) ?? false
+                }, beginHold: { [weak self] configured in
+                    self?.holdBeginPerformer(configured) ?? false
+                }, endHold: { [weak self] reason in
+                    self?.holdEndPerformer(reason)
                 })
         }
 
         for usage in released {
             let usedNativePassthrough = nativePassthroughUsages.remove(usage) != nil
             if let button = RemoteButton.usageMap[usage],
-               !usedNativePassthrough, shouldArmNativeEvent(for: button) {
+               !usedNativePassthrough,
+               shouldArmNativeEvent(for: button)
+                || settings.action(for: button, profileID: profileID) == .appSwitcher {
                 eventSuppressor.arm(button: button, edge: .up)
             }
             repeatTimers.removeValue(forKey: usage)?.cancel()
@@ -1165,7 +1845,12 @@ final class HIDRemoteMonitor {
         guard pressed.contains(RemoteButton.back.hidUsage) else { return }
         let configured = ConfiguredButtonAction(action: .deleteBackward, shortcut: nil)
         guard actionPerformer(.back, .singleClick, configured) else {
-            releaseForRevokedPermissions()
+            logActionFailure(
+                button: .back,
+                trigger: .singleClick,
+                action: .deleteBackward,
+                path: "back_only"
+            )
             return
         }
         AppLogger.shared.write(
@@ -1497,7 +2182,13 @@ final class HIDRemoteMonitor {
                 self.lastPageRepeatAt[usage] = now
             }
             if !self.actionPerformer(button, .singleClick, current) {
-                self.releaseForRevokedPermissions()
+                self.repeatTimers.removeValue(forKey: usage)?.cancel()
+                self.logActionFailure(
+                    button: button,
+                    trigger: .singleClick,
+                    action: current.action,
+                    path: "repeat"
+                )
             }
         }
         repeatTimers[usage] = timer
@@ -1560,7 +2251,38 @@ final class HIDRemoteMonitor {
         let repeated = snapshot.mode == .repeatLong ? snapshot.long : snapshot.single
         snapshot.repeatAllowed = Self.shouldRepeat(configured: repeated,
             frontmostBundleIdentifier: frontmostBundleIdentifier())
+        // 单击按住 / 长按按住使用当前生效方案里的动作；是否允许按住由该动作自己决定，
+        // 不能复用“重复单击”的能力判断。
+        if let resolved = holdTargetResolver?(profileID, button) {
+            snapshot.holdableSingle = resolved.single
+            snapshot.holdableLong = resolved.long
+        }
+        if let action = snapshot.holdDownAction, action.holdableKey != nil {
+            snapshot.repeatAllowed = Self.shouldRepeat(
+                action: action.action,
+                frontmostBundleIdentifier: frontmostBundleIdentifier()
+            )
+        }
+        // 方案解析后才知道动作是否可按住：不可用就回到“未设置”，不能把整键判死。
+        if let mode = snapshot.mode, mode.isHoldDown, !snapshot.blockers(for: mode).isEmpty {
+            snapshot.mode = .once
+        }
         return snapshot
+    }
+
+    /// A button action is a single-press request, not a monitor lifecycle event.
+    /// Keep the device monitor alive so one failed action cannot disable every
+    /// other button. Device removal and revoked permissions have their own paths.
+    private func logActionFailure(
+        button: RemoteButton,
+        trigger: ButtonTrigger,
+        action: ButtonAction,
+        path: String
+    ) {
+        diagnosticLogger(
+            "HID ACTION failed button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "action=\(action.rawValue) path=\(path) monitor_retained=true"
+        )
     }
 
     private func performConfiguredAction(
@@ -1603,15 +2325,15 @@ final class HIDRemoteMonitor {
             return true
         }
         guard actionPerformer(button, trigger, configured) else {
-            diagnosticLogger(
-                "HID ACTION failed button=\(button.rawValue) trigger=\(trigger.rawValue) " +
-                    "action=\(configured.action.rawValue)"
-            )
             // A library rejection is not evidence of revoked Accessibility permission.
             // Preserve the held edge so duplicate reports cannot restart the action.
-            if configured.action == .combinationAction { return false }
-            stop()
-            updateStatus(LocalizedMessage("button_mapping.permission.accessibility_expired"))
+            // The monitor remains alive; only this button's interaction is cancelled.
+            logActionFailure(
+                button: button,
+                trigger: trigger,
+                action: configured.action,
+                path: "button"
+            )
             return false
         }
         AppLogger.shared.write(
@@ -1627,6 +2349,8 @@ final class HIDRemoteMonitor {
         let wasActive = appSwitcherSession.isActive
         if !wasActive {
             appSwitcherOriginBundleIdentifier = frontmostBundleIdentifier()
+            // 记录打开切换器之前 Dock 的窗口数：切换器开着时 Dock 会多一个窗口。
+            appSwitcherDockWindowBaseline = appSwitcherDockWindowCount()
         }
         let phase = appSwitcherSession.isActive ? "tab" : "start"
         let submitted = appSwitcherSession.trigger()
@@ -1636,30 +2360,67 @@ final class HIDRemoteMonitor {
         )
         if submitted, !wasActive {
             startAppSwitcherLifecycle()
+            scheduleAppSwitcherOpenVerification()
         } else if submitted {
             scheduleAppSwitcherTimeout()
         } else if wasActive {
             finishAppSwitcherLifecycle(reason: "tab_failed", confirmed: false)
         } else {
+            appSwitcherTargetApplication = nil
+            appSwitcherPendingLayerClose = nil
             appSwitcherOriginBundleIdentifier = nil
         }
         return submitted
     }
 
-    private func handleAppSwitcherControlPress(_ button: RemoteButton) -> Bool {
+    private func handleAppSwitcherControlPress(
+        _ button: RemoteButton,
+        usage: UInt16,
+        swallowsOthers: Bool
+    ) -> Bool {
         switch button {
         case .ok:
+            if appSwitcherSession.isWindowPickerActive {
+                if let target = appSwitcherTargetApplication,
+                   windowCounter(target.processIdentifier) == 1 {
+                    // 单窗口时窗口层的高亮不可靠，Return 也可能不关窗口层；
+                    // 直接 Escape 退出窗口层，再恢复唯一窗口。
+                    // 窗口数按辅助功能的标准窗口统计（含最小化），避开隐藏面板。
+                    _ = appSwitcherSession.cancel()
+                    finishAppSwitcherLifecycle(
+                        reason: "single_window_confirmed",
+                        confirmed: true
+                    )
+                    scheduleSingleWindowRestore(selection: target)
+                    markPendingLayerClose(target)
+                    return true
+                }
+                // 原生语义：窗口层里没有高亮时，OK/Enter 不响应。
+                guard appSwitcherSession.pickerHasHighlight else {
+                    diagnosticLogger("HID APP SWITCHER ok_ignored reason=no_highlight")
+                    scheduleAppSwitcherTimeout()
+                    return true
+                }
+            }
+            // finishAppSwitcherLifecycle 会清空目标，必须先取出来再收尾。
+            let confirmedTarget = appSwitcherTargetApplication
             let confirmed = appSwitcherSession.confirm()
             finishAppSwitcherLifecycle(
                 reason: confirmed ? "confirmed" : "confirm_failed",
                 confirmed: confirmed
             )
+            if confirmed {
+                markPendingLayerClose(confirmedTarget)
+                scheduleForegroundEnsure(selection: confirmedTarget)
+            }
             return true
         case .back:
             finishAppSwitcherLifecycle(reason: "back", confirmed: false)
             return true
         case .left, .right:
-            let moved = appSwitcherSession.moveSelection(left: button == .left)
+            let left = button == .left
+            let highlightBefore = appSwitcherHighlightedTitle()
+            let moved = appSwitcherSession.moveSelection(left: left)
             diagnosticLogger(
                 "HID APP SWITCHER button=\(button.rawValue) phase=navigate success=\(moved)"
             )
@@ -1667,35 +2428,414 @@ final class HIDRemoteMonitor {
                 finishAppSwitcherLifecycle(reason: "navigate_failed", confirmed: false)
             } else {
                 scheduleAppSwitcherTimeout()
+                startAppSwitcherRepeat(usage: usage, button: button)
+                appSwitcherHasNavigated = true
+                if !appSwitcherSession.isWindowPickerActive {
+                    scheduleArrowNavigationCheck(
+                        highlightBefore: highlightBefore,
+                        left: left
+                    )
+                }
             }
             return true
         case .up, .down:
+            if !appSwitcherSession.isWindowPickerActive {
+                appSwitcherTargetApplication = appSwitcherSelectedApplication()
+                diagnosticLogger(
+                    "HID APP SWITCHER target bundle_id=" +
+                        (appSwitcherTargetApplication?.bundleIdentifier ?? "unknown") +
+                        " pid=\(appSwitcherTargetApplication?.processIdentifier ?? -1)"
+                )
+                // 单窗口 App 不进窗口层：直接松开 ⌘ 让切换器原生激活目标，
+                // 150ms 后再做一次恢复兜底。省掉窗口层的开合动画和 Esc。
+                if let target = appSwitcherTargetApplication,
+                   windowCounter(target.processIdentifier) == 1 {
+                    _ = appSwitcherSession.cancel()
+                    finishAppSwitcherLifecycle(
+                        reason: "single_window_direct",
+                        confirmed: true
+                    )
+                    scheduleSingleWindowRestore(
+                        selection: target,
+                        afterMilliseconds: HIDRemoteTiming
+                            .appSwitcherSingleWindowDirectRestoreMilliseconds
+                    )
+                    markPendingLayerClose(target)
+                    return true
+                }
+            }
+            let moved = appSwitcherSession.moveWindowSelection(up: button == .up)
             diagnosticLogger(
-                "HID APP SWITCHER button=\(button.rawValue) phase=navigate success=true " +
-                    "direction=unsupported"
+                "HID APP SWITCHER button=\(button.rawValue) phase=window_selection " +
+                    "success=\(moved)"
             )
+            if !moved {
+                finishAppSwitcherLifecycle(reason: "window_selection_failed", confirmed: false)
+            } else {
+                scheduleAppSwitcherTimeout()
+                startAppSwitcherRepeat(usage: usage, button: button)
+            }
             return true
         default:
+            // 会话期间吞掉未绑定切换器的按键（音量、主页等），避免误触。
+            // 绑定了切换器动作的按键（菜单/TV/音量）已在上层放行，等价于 Tab。
+            if !swallowsOthers { return false }
+            diagnosticLogger(
+                "HID APP SWITCHER swallowed button=\(button.rawValue) phase=session"
+            )
+            return true
+        }
+    }
+
+    /// 多窗口确认后 Return 不总是把 App 带到前台：300ms 时前台还不是目标 App
+    /// 就只做 App 激活，不动窗口层级。
+    private func scheduleForegroundEnsure(selection: KeyboardInjector.AppSwitcherSelection?) {
+        guard let selection else { return }
+        appSwitcherForegroundTask?.cancel()
+        appSwitcherForegroundTask = scheduler.schedule(
+            afterMilliseconds: HIDRemoteTiming.appSwitcherForegroundEnsureMilliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherForegroundTask = nil
+            guard !self.appSwitcherSession.isActive else { return }
+            // 按 bundle 判断“切换是否落地”：同名双实例时，Return 打开哪个实例
+            // 的窗口就尊重哪个，不能按 pid 强行纠正（那会盖掉正确的结果）。
+            guard self.frontmostBundleIdentifier() != selection.bundleIdentifier else {
+                self.appSwitcherPendingLayerClose = nil
+                return
+            }
+            let activated = self.applicationActivator(selection.processIdentifier)
+            self.diagnosticLogger(
+                "HID APP SWITCHER foreground_ensure bundle_id=\(selection.bundleIdentifier ?? "-") " +
+                    "pid=\(selection.processIdentifier) activated=\(activated)"
+            )
+        }
+    }
+
+    /// 确认后按方向键：如果切换没成功（前台不是目标进程），就重新起切换器
+    /// 并直接进入它的窗口层——这种状态下原来的方向键是“死键”。
+    /// 切换成功时（前台已是目标进程）方向键保持原映射。
+    private func handlePendingLayerCloseArrow(button: RemoteButton) -> Bool {
+        guard !appSwitcherSession.isActive else { return false }
+        guard let target = appSwitcherPendingLayerClose else { return false }
+        guard frontmostProcessIdentifier() != target.processIdentifier else {
+            appSwitcherPendingLayerClose = nil
             return false
         }
+        appSwitcherPendingLayerClose = nil
+        guard appSwitcherSession.trigger() else { return false }
+        startAppSwitcherLifecycle()
+        scheduleAppSwitcherTimeout()
+        appSwitcherPendingPickerEntry?.cancel()
+        appSwitcherPendingPickerEntry = scheduler.schedule(
+            afterMilliseconds: HIDRemoteTiming.appSwitcherWindowPickerEntryMilliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherPendingPickerEntry = nil
+            guard self.appSwitcherSession.isActive,
+                  !self.appSwitcherSession.isWindowPickerActive else { return }
+            self.appSwitcherTargetApplication = self.appSwitcherSelectedApplication()
+            self.diagnosticLogger(
+                "HID APP SWITCHER picker_reentered bundle_id=" +
+                    (self.appSwitcherTargetApplication?.bundleIdentifier ?? "unknown") +
+                    " pid=\(self.appSwitcherTargetApplication?.processIdentifier ?? -1)"
+            )
+            _ = self.appSwitcherSession.moveWindowSelection(up: button == .up)
+            self.scheduleAppSwitcherTimeout()
+        }
+        diagnosticLogger("HID APP SWITCHER picker_reenter_started")
+        return true
+    }
+
+    /// 确认后窗口层可能还开着（目标 App 没有窗口时 Return 不会关闭它）。
+    /// 记一小段时间，期间返回键可以直接把它关掉。
+    private func markPendingLayerClose(_ target: KeyboardInjector.AppSwitcherSelection?) {
+        guard let target else { return }
+        appSwitcherPendingLayerClose = target
+    }
+
+    /// 返回键兜底：确认没过、窗口层还开着时，返回键改发 Escape 而不是原映射。
+    private func handlePendingLayerCloseBack() -> Bool {
+        guard !appSwitcherSession.isActive else { return false }
+        guard let target = appSwitcherPendingLayerClose else { return false }
+        // 已经切到目标 App，说明这次确认生效了，之后返回键保持原映射。
+        // 判断用 bundle：同名双实例时进程号是猜的，而 macOS 13 上前台还会
+        // 短暂报告成我们自己的菜单栏 App，两者都会误判成“还没切过去”。
+        var landed = frontmostProcessIdentifier() == target.processIdentifier
+        if !landed, let bundleIdentifier = target.bundleIdentifier {
+            landed = frontmostBundleIdentifier() == bundleIdentifier
+        }
+        guard !landed else {
+            appSwitcherPendingLayerClose = nil
+            return false
+        }
+        appSwitcherPendingLayerClose = nil
+        _ = appSwitcherSession.dismissWindowPicker()
+        diagnosticLogger(
+            "HID APP SWITCHER back_escape bundle_id=\(target.bundleIdentifier ?? "-") " +
+                "pid=\(target.processIdentifier)"
+        )
+        return true
+    }
+
+    /// 只有单个窗口时，窗口选择层的高亮可能落到别的窗口条上，Return 会激活错的 App。
+    /// 这里退出窗口层后直接把唯一的窗口拉起来。
+    /// 退出窗口层后直接把唯一窗口恢复并置前；600ms 再重申一次，
+    /// 防止 Dock 关闭动画收尾或异步激活把前台压回原 App。
+    private func scheduleSingleWindowRestore(
+        selection: KeyboardInjector.AppSwitcherSelection,
+        afterMilliseconds: UInt64 = HIDRemoteTiming.appSwitcherExposeCloseMilliseconds
+    ) {
+        appSwitcherSingleWindowTask?.cancel()
+        appSwitcherSingleWindowTask = scheduler.schedule(
+            afterMilliseconds: afterMilliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherSingleWindowTask = nil
+            let restored = self.windowActivator(selection.processIdentifier)
+            self.diagnosticLogger(
+                "HID APP SWITCHER single_window bundle_id=\(selection.bundleIdentifier ?? "-") " +
+                    "pid=\(selection.processIdentifier) restored=\(restored)"
+            )
+            self.scheduleSingleWindowReassert(selection: selection)
+        }
+    }
+
+    /// 第一次恢复后如果前台仍不是目标进程（被瞬时压回），再补一次激活。
+    private func scheduleSingleWindowReassert(selection: KeyboardInjector.AppSwitcherSelection) {
+        appSwitcherSingleWindowTask = scheduler.schedule(
+            afterMilliseconds: HIDRemoteTiming.appSwitcherSingleWindowReassertMilliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherSingleWindowTask = nil
+            guard !self.appSwitcherSession.isActive else { return }
+            guard self.frontmostProcessIdentifier() != selection.processIdentifier else { return }
+            let reasserted = self.windowActivator(selection.processIdentifier)
+            self.diagnosticLogger(
+                "HID APP SWITCHER single_window_reassert bundle_id=\(selection.bundleIdentifier ?? "-") " +
+                    "pid=\(selection.processIdentifier) reasserted=\(reasserted)"
+            )
+        }
+    }
+
+    /// 切换器会话期间方向键由会话提前接管，普通“按住连发”不会启动；
+    /// 这里补一条独立连发，按住左右键可以连续移动选项。
+    private func startAppSwitcherRepeat(usage: UInt16, button: RemoteButton) {
+        guard button == .left || button == .right || button == .up || button == .down,
+              let interval = HIDRemoteTiming.repeatIntervalMilliseconds(for: button)
+        else { return }
+        repeatTimers.removeValue(forKey: usage)?.cancel()
+        let timer = scheduler.schedule(
+            afterMilliseconds: HIDRemoteTiming.repeatStartMilliseconds,
+            repeatingEveryMilliseconds: interval
+        ) { [weak self] in
+            guard let self else { return }
+            guard self.activeUsages.contains(usage), self.appSwitcherSession.isActive else {
+                self.repeatTimers.removeValue(forKey: usage)?.cancel()
+                return
+            }
+            guard self.runtimePermissionsAreValid() else {
+                self.releaseForRevokedPermissions()
+                return
+            }
+            let moved: Bool
+            switch button {
+            case .left, .right:
+                let left = button == .left
+                let highlightBefore = appSwitcherHighlightedTitle()
+                moved = self.appSwitcherSession.moveSelection(left: left)
+                if moved { self.appSwitcherHasNavigated = true }
+                if moved, !self.appSwitcherSession.isWindowPickerActive {
+                    self.scheduleArrowNavigationCheck(
+                        highlightBefore: highlightBefore,
+                        left: left
+                    )
+                }
+            case .up, .down:
+                moved = self.appSwitcherSession.moveWindowSelection(up: button == .up)
+            default:
+                moved = false
+            }
+            guard moved else {
+                self.repeatTimers.removeValue(forKey: usage)?.cancel()
+                self.finishAppSwitcherLifecycle(reason: "navigate_failed", confirmed: false)
+                return
+            }
+            self.appSwitcherDiagnostics.recordRepeat(button: button.rawValue)
+            self.scheduleAppSwitcherTimeout()
+        }
+        repeatTimers[usage] = timer
     }
 
     private func startAppSwitcherLifecycle() {
         scheduleAppSwitcherTimeout()
         appSwitcherConfirmationProbe?.cancel()
         appSwitcherConfirmationProbe = nil
+        appSwitcherMinimizedRestoreProbe?.cancel()
+        appSwitcherMinimizedRestoreProbe = nil
+        appSwitcherModifierWatchdog?.cancel()
+        appSwitcherModifierWatchdog = nil
+        appSwitcherSingleWindowTask?.cancel()
+        appSwitcherSingleWindowTask = nil
+        appSwitcherForegroundTask?.cancel()
+        appSwitcherForegroundTask = nil
+        appSwitcherPendingPickerEntry?.cancel()
+        appSwitcherPendingPickerEntry = nil
         appSwitcherFrontmostMonitor?.cancel()
+        appSwitcherObservedOpen = false
+        appSwitcherReopenCount = 0
+        appSwitcherHasNavigated = false
+        appSwitcherDiagnostics = AppSwitcherDiagnosticPolicy()
+        installAppSwitcherDismissObserver()
         appSwitcherFrontmostMonitor = scheduler.schedule(
             afterMilliseconds: HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds,
             repeatingEveryMilliseconds: HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds
         ) { [weak self] in
             guard let self, self.appSwitcherSession.isActive else { return }
-            guard let origin = self.appSwitcherOriginBundleIdentifier,
-                  let current = self.frontmostBundleIdentifier(),
-                  current != origin
-            else { return }
-            self.finishAppSwitcherLifecycle(reason: "frontmost_changed", confirmed: false)
+            // 窗口层（Exposé）里系统会把各种 App 报告为前台，前台没有参考价值。
+            guard !self.appSwitcherSession.isWindowPickerActive else { return }
+            // 这里只记录状态，不再据此结束会话。
+            //
+            // macOS 13 的真机日志证明：辅助功能里的切换器列表会在切换器明明开着时
+            // 随机消失（19/22 次会话在 1 秒内被判成“已关闭”），前台也会在
+            // “高亮 App”和“我们自己的菜单栏 App”之间来回跳。两种信号都不可靠，
+            // 据此收尾会让切换器一闪而过，并直接切到附近的 App。
+            //
+            // 现在的收尾条件只有三种：用户自己的操作（OK / 返回 / 再按一次绑定键）、
+            // 用户在切换器外点了鼠标（外部关闭），以及会话超时。
+            let state = self.appSwitcherHudState()
+            let dockWindows = self.appSwitcherDockWindowCount()
+            let baseline = self.appSwitcherDockWindowBaseline ?? -1
+            // 只在稳定信号真的变化时写一行。前台 App 不参与判定：它在“高亮 App”
+            // 和“我们自己的菜单栏 App”之间来回跳，拼进签名等于每 tick 一行。
+            let relation = dockWindows > baseline
+                ? "above"
+                : (dockWindows == baseline ? "at" : "below")
+            if self.appSwitcherDiagnostics.recordStatePoll(
+                signature: "\(state.logLabel)|\(relation)"
+            ) {
+                self.diagnosticLogger(
+                    "HID APP SWITCHER switcher_state ax=\(state.logLabel) " +
+                        "dock_windows=\(dockWindows) " +
+                        "baseline=\(baseline) " +
+                        "front=\(self.frontmostBundleIdentifier() ?? "-")"
+                )
+            }
+            // 见过切换器打开、之后又不见了：说明它被系统自己关掉了
+            // （部分系统上原生键码或切换器自身行为会关掉它）。
+            // 补发一次 Tab 把它拉回来，让“切换器定住”这件事成立。
+            if baseline >= 0 {
+                if dockWindows > baseline {
+                    self.appSwitcherObservedOpen = true
+                } else if self.appSwitcherObservedOpen {
+                    self.appSwitcherObservedOpen = false
+                    // 用户已经选过东西时不再拉回：补发的 Tab 会移动高亮，
+                    // 把用户选好的目标冲掉。这种情况下让会话结束更安全，
+                    // 用户再按一次方向键就能重新进入窗口层。
+                    guard !self.appSwitcherHasNavigated else { return }
+                    guard self.appSwitcherReopenCount < 3 else { return }
+                    self.appSwitcherReopenCount += 1
+                    let reopened = self.appSwitcherSession.trigger()
+                    self.diagnosticLogger(
+                        "HID APP SWITCHER switcher_reopen attempt=\(self.appSwitcherReopenCount) " +
+                            "success=\(reopened)"
+                    )
+                }
+            }
         }
+    }
+
+    /// 方向键之后核对切换器高亮是否真的移动了。
+    ///
+    /// macOS 14/15 的切换器不响应方向键（真机验证：⌘←/⌘→ 不移动高亮），
+    /// 而 ⌘Tab 循环有效。核对失败就把方向键标记为不可用，并用 Tab 循环补一次
+    /// 移动；核对成功则记住方向键可用，之后保持原行为。
+    private func scheduleArrowNavigationCheck(highlightBefore: String?, left: Bool) {
+        appSwitcherArrowCheck?.cancel()
+        appSwitcherArrowCheck = scheduler.schedule(
+            afterMilliseconds: HIDRemoteTiming.appSwitcherArrowNavigationCheckMilliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherArrowCheck = nil
+            guard self.appSwitcherSession.isActive else { return }
+            let highlightAfter = self.appSwitcherHighlightedTitle()
+            // 读不到高亮就说明不了问题：不改判定，也不重复移动。
+            guard let highlightBefore, let highlightAfter else { return }
+            if highlightBefore == highlightAfter {
+                self.appSwitcherSession.markArrowNavigation(supported: false)
+                let cycled = self.appSwitcherSession.cycleSelection(backwards: left)
+                self.diagnosticLogger(
+                    "HID APP SWITCHER arrow_nav supported=false fallback_cycle=\(cycled)"
+                )
+            } else {
+                self.appSwitcherSession.markArrowNavigation(supported: true)
+                self.diagnosticLogger("HID APP SWITCHER arrow_nav supported=true")
+            }
+        }
+    }
+
+    /// 打开切换器之后核对它是否真的出现了。
+    ///
+    /// 真机日志（macOS 14/15）里第一次按“⌘ 刚按下 + Tab”经常打不开切换器，
+    /// 而稍后再按一次（⌘ 已经按住）就能打开。这里核对一次，没打开就补发一次
+    /// Tab——这条路径在出问题的系统上是有效的。
+    private func scheduleAppSwitcherOpenVerification() {
+        appSwitcherOpenProbe?.cancel()
+        appSwitcherOpenProbe = scheduler.schedule(
+            afterMilliseconds: HIDRemoteTiming.appSwitcherOpenVerificationMilliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherOpenProbe = nil
+            guard self.appSwitcherSession.isActive else { return }
+            let baseline = self.appSwitcherDockWindowBaseline ?? 0
+            let dockWindows = self.appSwitcherDockWindowCount()
+            var axVisible = false
+            if case .visible = self.appSwitcherHudState() { axVisible = true }
+            guard dockWindows <= baseline, !axVisible else { return }
+            let retried = self.appSwitcherSession.trigger()
+            self.diagnosticLogger(
+                "HID APP SWITCHER switcher_open retried=\(retried) " +
+                    "dock_windows=\(dockWindows) baseline=\(baseline)"
+            )
+        }
+    }
+
+    /// 注册“切换器被外部关闭”的观察者。
+    ///
+    /// 切换器开着时用户点击别处会把它关掉，系统不会再给我们任何按键，
+    /// 必须由这个观察者松开 ⌘，否则修饰键会一直卡在按下状态。
+    private func installAppSwitcherDismissObserver() {
+        removeAppSwitcherDismissObserver()
+        appSwitcherDismissRemover = appSwitcherDismissObserverInstaller { [weak self] in
+            guard let self, self.appSwitcherSession.isActive else { return }
+            self.finishAppSwitcherLifecycle(
+                reason: "mouse_click",
+                confirmed: false,
+                switcherAlreadyDismissed: true
+            )
+        }
+    }
+
+    private func removeAppSwitcherDismissObserver() {
+        appSwitcherDismissRemover?()
+        appSwitcherDismissRemover = nil
+    }
+
+    /// 默认的外部关闭观察者：监听鼠标点击。
+    static func installMouseClickDismissObserver(_ handler: @escaping () -> Void) -> (() -> Void)? {
+        let monitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { _ in
+            handler()
+        }
+        guard let monitor else { return nil }
+        return { NSEvent.removeMonitor(monitor) }
     }
 
     private func scheduleAppSwitcherTimeout() {
@@ -1709,18 +2849,31 @@ final class HIDRemoteMonitor {
         }
     }
 
-    private func finishAppSwitcherLifecycle(reason: String, confirmed: Bool) {
+    /// `switcherAlreadyDismissed` 表示系统已经自己关掉切换器（目前只有鼠标点击外部），
+    /// 收尾时只能松开 ⌘，不能再往被点击的 App 补 Escape。
+    private func finishAppSwitcherLifecycle(
+        reason: String,
+        confirmed: Bool,
+        switcherAlreadyDismissed: Bool = false
+    ) {
         appSwitcherTimeout?.cancel()
         appSwitcherTimeout = nil
         appSwitcherFrontmostMonitor?.cancel()
         appSwitcherFrontmostMonitor = nil
+        removeAppSwitcherDismissObserver()
+        appSwitcherDockWindowBaseline = nil
         if appSwitcherSession.isActive {
-            _ = appSwitcherSession.cancel()
+            _ = appSwitcherSession.cancel(dismissSwitcher: !switcherAlreadyDismissed)
         }
         diagnosticLogger(
-            "HID APP SWITCHER ended reason=\(reason) confirmed=\(confirmed)"
+            "HID APP SWITCHER ended reason=\(reason) confirmed=\(confirmed) " +
+                "repeat_count=\(appSwitcherDiagnostics.repeatCount) " +
+                "repeat_buttons=\(appSwitcherDiagnostics.repeatBreakdown) " +
+                "state_polls=\(appSwitcherDiagnostics.statePollCount) " +
+                "state_lines=\(appSwitcherDiagnostics.stateLineCount)"
         )
         if confirmed {
+            let origin = appSwitcherOriginBundleIdentifier
             appSwitcherConfirmationProbe?.cancel()
             appSwitcherConfirmationProbe = scheduler.schedule(
                 afterMilliseconds: HIDRemoteTiming.appSwitcherConfirmationProbeMilliseconds,
@@ -1730,11 +2883,70 @@ final class HIDRemoteMonitor {
                 self.appSwitcherConfirmationProbe = nil
                 self.diagnosticLogger(
                     "HID APP SWITCHER selection bundle_id=" +
-                        (self.frontmostBundleIdentifier() ?? "unknown")
+                        (self.frontmostBundleIdentifier() ?? "unknown") +
+                        " pid=\(self.frontmostProcessIdentifier() ?? -1)"
+                )
+                // 目标 App 没有可用窗口时，Return 不会关掉窗口层；
+                // 此时会话已结束，返回键不再被拦截，只能补一个 Escape。
+                if KeyboardInjector.appSwitcherSelectedApplication() != nil {
+                    _ = self.appSwitcherSession.dismissWindowPicker()
+                    self.diagnosticLogger("HID APP SWITCHER stuck_switcher escaped=true")
+                }
+            }
+            // 系统的 Option 恢复依赖 Dock 内部时序，真机并不总是生效；
+            // 到这里再按可见窗口状态兜底一次，保证窗口真的回到前台。
+            scheduleMinimizedWindowRestore(
+                afterMilliseconds: HIDRemoteTiming.appSwitcherMinimizedRestoreProbeMilliseconds,
+                attempt: 0,
+                origin: origin
+            )
+            // 释放 ⌥/⌘ 的任务挂在可注入调度器上，调度器不执行时必须强制放开，
+            // 否则 Command 会一直按下，之后所有按键都会变成快捷键。
+            appSwitcherModifierWatchdog?.cancel()
+            appSwitcherModifierWatchdog = scheduler.schedule(
+                afterMilliseconds: HIDRemoteTiming.appSwitcherModifierWatchdogMilliseconds,
+                repeatingEveryMilliseconds: nil
+            ) { [weak self] in
+                guard let self else { return }
+                self.appSwitcherModifierWatchdog = nil
+                guard self.appSwitcherSession.hasPendingRelease else { return }
+                let released = self.appSwitcherSession.forceReleaseModifiersIfNeeded()
+                self.diagnosticLogger(
+                    "HID APP SWITCHER watchdog released_modifiers=\(released)"
                 )
             }
         }
+        appSwitcherTargetApplication = nil
+        appSwitcherPendingLayerClose = nil
         appSwitcherOriginBundleIdentifier = nil
+    }
+
+    private func scheduleMinimizedWindowRestore(
+        afterMilliseconds milliseconds: UInt64,
+        attempt: Int,
+        origin: String?
+    ) {
+        appSwitcherMinimizedRestoreProbe?.cancel()
+        appSwitcherMinimizedRestoreProbe = scheduler.schedule(
+            afterMilliseconds: milliseconds,
+            repeatingEveryMilliseconds: nil
+        ) { [weak self] in
+            guard let self else { return }
+            self.appSwitcherMinimizedRestoreProbe = nil
+            let frontmost = self.frontmostBundleIdentifier()
+            let result = self.minimizedWindowRestorer(frontmost, origin)
+            self.diagnosticLogger(
+                "HID APP SWITCHER restore attempt=\(attempt) " +
+                    "bundle_id=\(frontmost ?? "unknown") result=\(result.rawValue)"
+            )
+            if result == .skippedNotFrontmost, attempt == 0 {
+                self.scheduleMinimizedWindowRestore(
+                    afterMilliseconds: HIDRemoteTiming.appSwitcherMinimizedRestoreRetryMilliseconds,
+                    attempt: 1,
+                    origin: origin
+                )
+            }
+        }
     }
 
     private func resetGestureRecognition() {
@@ -1746,7 +2958,11 @@ final class HIDRemoteMonitor {
         gestureRecognizer.reset()
     }
 
-    func cancelMappingInteractions() { resetInputState() }
+    func cancelMappingInteractions() {
+        // 按住执行把键真正按下去了，取消映射时必须先走一遍交互取消把键抬起来。
+        buttonInteractions.cancelAll(reason: "mapping_cancelled")
+        resetInputState()
+    }
 
     func cancelConfiguredInteractions(reason: String) { buttonInteractions.cancelAll(reason: reason) }
 
@@ -1773,6 +2989,24 @@ final class HIDRemoteMonitor {
         appSwitcherFrontmostMonitor = nil
         appSwitcherConfirmationProbe?.cancel()
         appSwitcherConfirmationProbe = nil
+        appSwitcherMinimizedRestoreProbe?.cancel()
+        appSwitcherMinimizedRestoreProbe = nil
+        appSwitcherModifierWatchdog?.cancel()
+        appSwitcherModifierWatchdog = nil
+        appSwitcherSingleWindowTask?.cancel()
+        appSwitcherSingleWindowTask = nil
+        appSwitcherForegroundTask?.cancel()
+        appSwitcherForegroundTask = nil
+        appSwitcherPendingPickerEntry?.cancel()
+        appSwitcherPendingPickerEntry = nil
+        appSwitcherArrowCheck?.cancel()
+        appSwitcherArrowCheck = nil
+        appSwitcherOpenProbe?.cancel()
+        appSwitcherOpenProbe = nil
+        removeAppSwitcherDismissObserver()
+        appSwitcherDockWindowBaseline = nil
+        appSwitcherTargetApplication = nil
+        appSwitcherPendingLayerClose = nil
         appSwitcherOriginBundleIdentifier = nil
         for usage in activeUsages.subtracting(nativePassthroughUsages) {
             if let button = RemoteButton.usageMap[usage], shouldArmNativeEvent(for: button) {
@@ -1798,14 +3032,27 @@ final class HIDRemoteMonitor {
 
     private func shouldArmNativeEvent(for button: RemoteButton) -> Bool {
         // UserKeyMapping readback only proves that the mapping was written. It
-        // does not prove that macOS stopped delivering the native event. Intel
-        // monitored mode can still deliver TV/volume events after a successful
-        // readback, so keep the event-tap fallback for those three controls.
+        // does not prove that macOS stopped delivering the native event: Intel
+        // monitored mode still delivers TV/volume events after a successful
+        // readback, so those three controls always keep the event-tap fallback.
+        // Callers already skip this for intentional native passthrough.
         if button == .tv || button == .volumeUp || button == .volumeDown {
             return Self.needsEventLevelArm(
                 seized: activeDeviceIsSeized,
                 neutralized: nativeKeysNeutralized
             )
+        }
+        // 方向键同样会被泄漏（2026-11-07 现场：一次按下把光标推了两格），但它与实体
+        // 键盘完全同码，登记等于凭空开出会吞掉键盘方向键的窗口，因此按
+        // `directionalNativeFallback` 收窄到有现场证据的构建（默认 Intel）。
+        // 映射未生效时方向键本来就没有源头隔离，登记是修复前就有的行为，必须保留：
+        // 默认左右动作走原生透传由调用点排除，其余动作（自定义快捷键等）仍要靠它。
+        if button.isDirectional {
+            guard Self.needsEventLevelArm(
+                seized: activeDeviceIsSeized,
+                neutralized: nativeKeysNeutralized
+            ) else { return false }
+            return !nativeKeysNeutralized || directionalNativeFallback
         }
         return !nativeKeysNeutralized
     }
@@ -1816,6 +3063,10 @@ final class HIDRemoteMonitor {
         guard prepareNativeKeys() else {
             updateStatus(LocalizedMessage("button_mapping.error.native_mapping_failed"))
             diagnosticLogger("HID DEVICE rejected reason=native_mapping_not_verified")
+            // 设备匹配先于 HID 服务可枚举是重连时的常态：`RemoteNativeKeyMapper` 的
+            // `prepare()` 因此写成「每次设备激活重新枚举」，但校验失败后没有任何重试，
+            // 于是一次 `reason=no_service` 就让设备永久不被接管。
+            onNativeMappingVerificationFailed?()
             return false
         }
         nativeKeysNeutralized = true

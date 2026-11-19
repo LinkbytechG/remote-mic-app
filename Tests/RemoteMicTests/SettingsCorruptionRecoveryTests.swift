@@ -11,7 +11,7 @@ struct SettingsCorruptionRecoveryTests {
 
     @Test func legacyChromecastProfilesRetainEveryDeviceAndMappingOnUpgrade() throws {
         let suiteName = "SettingsCorruptionRecoveryTests.legacyChromecast.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let mappings = RemoteDeviceMappings(
             buttonBindings: AppSettings.defaultBindings.merging([.up: .commandCopy]) { _, saved in saved },
@@ -62,7 +62,7 @@ struct SettingsCorruptionRecoveryTests {
         suiteName: inout String
     ) throws -> UserDefaults {
         suiteName = "SettingsCorruptionRecoveryTests.\(label).\(UUID().uuidString)"
-        return try #require(UserDefaults(suiteName: suiteName))
+        return try #require(TestUserDefaults(suiteName: suiteName))
     }
 
     @Test func unreadableButtonBindingsFallBackToDefaultsAndAreReportedAsCorrupt() throws {
@@ -129,9 +129,13 @@ struct SettingsCorruptionRecoveryTests {
 
         #expect(settings.corruptedSettingKeys == ["remoteDeviceProfiles"])
         #expect(defaults.data(forKey: "remoteDeviceProfiles.corrupt") == payload)
-        // Unlike `buttonBindings`, this key is pre-initialized to `[]` before the load, so the
-        // migration assignment fires its `didSet` and persists over the unreadable payload
-        // during the very same launch. The ".corrupt" copy is the only surviving evidence.
+        // The load-time write-back guard keeps the unreadable payload in place until a later
+        // save. The ".corrupt" copy and the fallback profile are still available now.
+        #expect(defaults.data(forKey: "remoteDeviceProfiles") == payload)
+        // The first later save preserves the original bytes in the recovery key before it
+        // replaces the live value.
+        settings.registerBluetoothRemote(identifier: UUID())
+        #expect(defaults.data(forKey: AppSettings.unreadableRemoteProfilesBackupKey) == payload)
         #expect(defaults.data(forKey: "remoteDeviceProfiles") != payload)
         // Same fallback as before: one migrated profile carrying the legacy mappings.
         #expect(settings.remoteDeviceProfiles.count == 1)
@@ -332,7 +336,7 @@ struct CorruptedSettingsNoticeTests {
 
     @Test func aRealCorruptedLoadIsNamedPreciselyRatherThanGenerically() throws {
         let suiteName = "CorruptedSettingsNoticeTests.corrupted.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         for key in ["buttonBindings", "customApplicationProfiles", "usage.dailyStatistics"] {
             defaults.set(Data("not json".utf8), forKey: key)
@@ -362,7 +366,7 @@ struct CorruptedSettingsNoticeTests {
 
     @Test func aRealHealthyLoadKeepsTheNoticeCompletelyHidden() throws {
         let suiteName = "CorruptedSettingsNoticeTests.healthy.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let saved = AppSettings(defaults: defaults)

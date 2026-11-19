@@ -104,6 +104,7 @@ enum VoiceRemoteAdmission {
     static func decide(
         identifier: UUID,
         targetIdentifier: UUID?,
+        knownIdentifiers: Set<UUID> = [],
         advertisesVoiceService: Bool,
         name: String?,
         advertisedName: String?
@@ -114,7 +115,7 @@ enum VoiceRemoteAdmission {
         if let foreign = ForeignVoiceRemoteProduct.rejectedName(nameForMatch) {
             return .rejectForeignProduct(foreign)
         }
-        if let targetIdentifier {
+        if let targetIdentifier = targetIdentifier ?? (knownIdentifiers.contains(identifier) ? identifier : nil) {
             // 身份优先于名称：用户改过名的遥控器仍然必须是同一台设备。
             return identifier == targetIdentifier ? .adoptSavedIdentity : .ignore
         }
@@ -127,6 +128,32 @@ enum VoiceRemoteAdmission {
         }
         // 只认名字，不认「服务存在」：ATVV 是通用服务，协议相同不等于型号相同。
         return .rejectUnnamed
+    }
+}
+
+/// `connect()` 的准入条件。
+///
+/// 抽成纯函数有两个原因：一是这些条件不满足时旧实现静默 `return`，而调用它的 `adopt()` 仍然
+/// 返回 `true`，日志于是写成 `result=adopted` 却看不到 `BLE CONNECTING`（Issue #1041）；
+/// 二是纯函数可以逐条回归，不必构造真实的 `CBCentralManager`。
+enum BluetoothConnectGate {
+    /// 返回跳过原因；`nil` 表示可以发起连接。
+    static func skipReason(
+        shouldRun: Bool,
+        isSystemSuspended: Bool,
+        isSameCentral: Bool,
+        hasPeripheral: Bool,
+        lifecycle: BluetoothLifecyclePhase,
+        generation: UInt64
+    ) -> String? {
+        guard shouldRun else { return "not_running" }
+        guard !isSystemSuspended else { return "system_suspended" }
+        guard isSameCentral else { return "central_replaced" }
+        guard !hasPeripheral else { return "peripheral_busy" }
+        guard lifecycle == .scanning(generation) else {
+            return "lifecycle_\(lifecycle.logName)"
+        }
+        return nil
     }
 }
 
@@ -160,6 +187,24 @@ enum BluetoothLifecyclePhase: Equatable {
     var isReady: Bool {
         if case .ready = self { return true }
         return false
+    }
+
+    /// 诊断用短名。只出现在日志里，不参与任何判定。
+    ///
+    /// 跳过连接时必须说清当时停在哪个阶段：`lifecycle=connecting`（已有连接在飞）与
+    /// `lifecycle=ready`（已经连上）是两种完全不同的原因，只说「跳过」等于没说。
+    var logName: String {
+        switch self {
+        case .stopped: return "stopped"
+        case .scanning: return "scanning"
+        case .connecting: return "connecting"
+        case .discovering: return "discovering"
+        case .awaitingCapabilities: return "awaiting_capabilities"
+        case .ready: return "ready"
+        case .disconnecting: return "disconnecting"
+        case .waitingReconnect: return "waiting_reconnect"
+        case .waitingBluetoothPower: return "waiting_bluetooth_power"
+        }
     }
 
     func acceptsDidConnect(generation: UInt64) -> Bool {
@@ -243,17 +288,32 @@ struct BluetoothReconnectPolicy {
     static let baseDelay: TimeInterval = 3
     static let maximumDelay: TimeInterval = 60
     static let jitterRatio = 0.1
+    static let cachedTargetProbeInterval: TimeInterval = 60
 
     private(set) var consecutiveFailureCount = 0
     private(set) var allowsCachedTargetRetrieval = true
+    private var nextCachedTargetProbeAt: TimeInterval?
+
+    /// A failed cached target stays bypassed between bounded probes. Keep that state
+    /// when retrieval returns no peripheral so the scan window can still expire.
+    mutating func shouldRetrieveCachedTarget(at uptime: TimeInterval) -> Bool {
+        if allowsCachedTargetRetrieval { return true }
+        guard let nextCachedTargetProbeAt, uptime >= nextCachedTargetProbeAt else {
+            return false
+        }
+        self.nextCachedTargetProbeAt = uptime + Self.cachedTargetProbeInterval
+        return true
+    }
 
     mutating func nextAutomaticDelay(
         bypassCachedTarget: Bool,
-        jitterUnit: Double
+        jitterUnit: Double,
+        uptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> TimeInterval {
         consecutiveFailureCount += 1
         if bypassCachedTarget {
             allowsCachedTargetRetrieval = false
+            nextCachedTargetProbeAt = uptime + Self.cachedTargetProbeInterval
         }
 
         let exponent = min(consecutiveFailureCount - 1, 5)
@@ -270,25 +330,30 @@ struct BluetoothReconnectPolicy {
     mutating func reset() {
         consecutiveFailureCount = 0
         allowsCachedTargetRetrieval = true
+        nextCachedTargetProbeAt = nil
     }
 }
 
-/// 发现路径选择：三条路径各有前提，把「系统当前已连接的候选」写死成
-/// `targetIdentifier == nil` 会让「有已保存身份 + 缓存直连已被禁用」这一组合只剩广播扫描。
-enum VoiceRemoteDiscoveryPolicy {
-    /// 是否要查询系统当前已连接的 ATVV 候选（`retrieveConnectedPeripherals`）。
-    ///
-    /// - 没有已保存身份：必须查——遥控器可能早已在系统设置里配对连接。
-    /// - 有已保存身份、但缓存直连已被禁用：也要查。此时设备通常仍以 HID 连着系统，
-    ///   如果外设没有广播，只靠扫描无法发现它。
-    ///   现场日志（2026-10-11 rc003）：卡死 16–75 分钟，手动「立即重新连接」后
-    ///   按已保存 UUID 20–30 ms 恢复；静默期的系统连接状态仍不可确定。
-    /// - 有已保存身份且缓存直连可用：`retrievePeripherals` 已经覆盖，不重复查。
-    static func shouldQuerySystemConnectedCandidates(
-        hasSavedTarget: Bool,
-        allowsCachedTargetRetrieval: Bool
-    ) -> Bool {
-        !hasSavedTarget || !allowsCachedTargetRetrieval
+enum VoiceRemoteDiscoverySource: String {
+    case cachedTarget = "target_identifier"
+    case systemConnected = "connected_peripheral"
+}
+
+/// 生产与回归共用发现顺序，系统查询和设备采纳由调用方提供。
+enum VoiceRemoteDiscovery {
+    static func run<Candidate>(
+        retrieveCachedTarget: () -> Candidate?,
+        retrieveConnectedCandidates: () -> [Candidate],
+        adopt: (Candidate, VoiceRemoteDiscoverySource) -> Bool,
+        startScan: () -> Void
+    ) {
+        if let cached = retrieveCachedTarget(), adopt(cached, .cachedTarget) {
+            return
+        }
+        for candidate in retrieveConnectedCandidates() {
+            if adopt(candidate, .systemConnected) { return }
+        }
+        startScan()
     }
 }
 
@@ -297,16 +362,27 @@ enum VoiceRemoteDiscoveryPolicy {
 /// `scanForPeripherals` 不会因为「找不到」回调，所以没有窗口时一次未命中的 attempt
 /// 会永远停在 `.scanning`：退避计数不再增长，`finishAttempt` 不再执行，
 /// 重连循环静默终止（现场日志里持续 16–75 分钟，直到用户手动重连）。
+///
+/// 只要有已保存身份就必须开窗口，不能再用「缓存直连可用」豁免：息屏唤醒后
+/// `retrievePeripherals(withIdentifiers:)` 可能返回空，同时遥控器仍以 HID 连着系统、
+/// 不再广播。此时只剩扫描，而没有窗口的扫描既不会重试，也不会再次查询
+/// `retrieveConnectedPeripherals`，链路就静默停死（1.9.21 现场：21:23 唤醒后
+/// 到 21:36 零条 BLE 事件，HID 按键始终正常）。
 enum BluetoothScanRecoveryPolicy {
-    /// 单个扫描窗口。取 20 秒：覆盖遥控器从省电态恢复广播的时间，又明显小于 60 秒退避上限，
-    /// 保证「扫描 → 未命中 → 退避 → 再试」这条循环始终在推进。
+    /// 单个扫描窗口。取 20 秒：覆盖遥控器从省电态恢复广播的时间，又明显小于 60 秒退避上限。
     static let scanWindow: TimeInterval = 20
 
-    static func shouldStartScanTimeout(
-        hasSavedTarget: Bool,
-        allowsCachedTargetRetrieval: Bool
-    ) -> Bool {
-        hasSavedTarget && !allowsCachedTargetRetrieval
+    static func shouldStartScanTimeout(hasSavedTarget: Bool) -> Bool {
+        hasSavedTarget
+    }
+
+    /// 发现流程收尾时是否还允许真的开一次扫描。
+    ///
+    /// 所有候选都被拒之后 `VoiceRemoteDiscovery` 会调用 `startScan`，但此时状态可能已经
+    /// 离开 `.scanning`——例如某个候选已经进入 `.connecting`，只因为前置条件被跳过而返回了
+    /// `false`。这种情况下再开扫描会让 `state` 与 `lifecycle` 分叉，必须由调用方跳过。
+    static func canStartScan(lifecycle: BluetoothLifecyclePhase, generation: UInt64) -> Bool {
+        lifecycle == .scanning(generation)
     }
 
     /// 窗口到期时是否真的结束本次 attempt（状态已变化时作废，例如已经连上进入 discovering）。
@@ -318,6 +394,22 @@ enum BluetoothScanRecoveryPolicy {
     ) -> Bool {
         guard shouldRun, !isSystemSuspended else { return false }
         return lifecycle == .scanning(generation)
+    }
+
+    static func handleTimeout(
+        lifecycle: BluetoothLifecyclePhase,
+        generation: UInt64,
+        shouldRun: Bool,
+        isSystemSuspended: Bool,
+        retry: () -> Void
+    ) {
+        guard shouldExpireScan(
+            lifecycle: lifecycle,
+            generation: generation,
+            shouldRun: shouldRun,
+            isSystemSuspended: isSystemSuspended
+        ) else { return }
+        retry()
     }
 }
 
@@ -374,7 +466,8 @@ enum BluetoothCentralRecoveryPolicy {
         from phase: BluetoothLifecyclePhase,
         generation: UInt64,
         event: BluetoothCentralRecoveryEvent,
-        shouldRun: Bool
+        shouldRun: Bool,
+        isDiscoveryObserver: Bool = false
     ) -> BluetoothCentralRecoveryTransition {
         switch event {
         case .poweredOff, .resetting:
@@ -405,7 +498,8 @@ enum BluetoothCentralRecoveryPolicy {
                 )
             }
             let requiresFreshConnectionCycle = phase == .waitingReconnect(generation) ||
-                phase == .waitingBluetoothPower(generation)
+                phase == .waitingBluetoothPower(generation) ||
+                (isDiscoveryObserver && phase == .stopped)
             return BluetoothCentralRecoveryTransition(
                 phase: requiresFreshConnectionCycle ? .stopped : phase,
                 shouldCancelScheduledReconnect: requiresFreshConnectionCycle,
@@ -420,7 +514,7 @@ enum BluetoothCentralRecoveryPolicy {
                 shouldCancelScheduledReconnect: true,
                 shouldDiscover: false,
                 shouldStartFreshConnectionCycle: false,
-                shouldReleaseCentral: true
+                shouldReleaseCentral: !isDiscoveryObserver || !shouldRun
             )
         }
     }

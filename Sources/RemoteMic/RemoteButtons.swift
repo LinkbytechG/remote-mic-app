@@ -139,6 +139,18 @@ enum RemoteButton: String, CaseIterable, Codable, Identifiable {
         guard let nativeEvent else { return [] }
         return self == .tv ? [nativeEvent, .keyboard(keyCode: 50)] : [nativeEvent]
     }
+
+    /// 四颗方向键。它们的原生键码与实体键盘完全同码，因此拦截图层的登记范围
+    /// 必须单独判断：既要覆盖 Intel 上映射回读之后仍会泄漏的原生方向键，又不能
+    /// 在默认透传会话里抢先吞掉唯一一次移动。
+    var isDirectional: Bool {
+        self == .up || self == .down || self == .left || self == .right
+    }
+
+    /// Maintaining a keyboard key-down is available only on the physical left/right buttons.
+    var allowsKeyHold: Bool {
+        self == .left || self == .right
+    }
 }
 
 /// 键位方案覆盖名单里的一项：四颗方向键合并成一项，其余按键逐颗列出。
@@ -646,6 +658,36 @@ struct ConfiguredButtonAction: Codable, Equatable {
         action.isDirectionalOrDeleteBackward ||
             (action == .customShortcut && shortcut?.isRepeatableNavigationKey == true)
     }
+
+    /// 「按住执行」要一直按住的键。
+    ///
+    /// 只有方向键成立：其他动作（打开 App、组合动作、滚动）没有“按下去不放”的系统语义，
+    /// 让它们进入按下状态只会在目标 App 里留下无法解释的状态。
+    /// 判定放在动作类型这里，自测脚本单独编译该文件时也能拿到相同结论。
+    var holdableKey: HoldableKey? {
+        switch action {
+        case .arrowUp:
+            return HoldableKey(keyCode: 126, flags: [])
+        case .arrowDown:
+            return HoldableKey(keyCode: 125, flags: [])
+        case .arrowLeft:
+            return HoldableKey(keyCode: 123, flags: [])
+        case .arrowRight:
+            return HoldableKey(keyCode: 124, flags: [])
+        case .customShortcut:
+            // 录制下来的方向键同样是方向键；修饰键按录制结果一起按住。
+            guard let shortcut, (123...126).contains(shortcut.keyCode) else { return nil }
+            return HoldableKey(keyCode: CGKeyCode(shortcut.keyCode), flags: shortcut.cgEventFlags)
+        default:
+            return nil
+        }
+    }
+}
+
+/// 可以被「按住执行」一直按住的目标键。
+struct HoldableKey: Equatable {
+    let keyCode: CGKeyCode
+    let flags: CGEventFlags
 }
 
 enum CustomApplicationFocusStrategy: String, Codable, CaseIterable, Identifiable {
@@ -713,6 +755,23 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         self.focusShortcut = focusShortcut
         self.accessibilityTarget = accessibilityTarget
         self.scrollRegionTarget = scrollRegionTarget
+    }
+}
+
+enum CustomApplicationLaunchPlan: Equatable {
+    case open(focusAllowed: Bool)
+    case unavailable
+
+    static func resolve(
+        profile: CustomApplicationProfile?,
+        requiresVerification: Bool,
+        applicationURL: URL?
+    ) -> Self {
+        guard profile != nil, applicationURL != nil else { return .unavailable }
+        // The portable-import marker protects the unverified focus target. It
+        // must not block opening the app; skip the automatic focus until the
+        // user verifies it.
+        return .open(focusAllowed: !requiresVerification)
     }
 }
 
@@ -838,8 +897,12 @@ enum AccessibilityFocusPreset {
 
 enum ButtonActionCategory: String, CaseIterable, Identifiable {
     case basicKeys
+    case customShortcuts
     case systemAndMedia
     case custom
+    /// 「组合动作」和「常用语」一样是独立的动作分类：它的候选来自宏库卡片，
+    /// 不是动作网格里的一项，因此不参与 `ButtonAction` 的逐个列举。
+    case combinations
     case commonPhrases
     case applications
 
@@ -848,8 +911,10 @@ enum ButtonActionCategory: String, CaseIterable, Identifiable {
     var localizationKey: String {
         switch self {
         case .basicKeys: return "button_mapping.action_group.basic_keys"
+        case .customShortcuts: return "action.custom_shortcut"
         case .systemAndMedia: return "button_mapping.action_group.system_and_media"
         case .custom: return "button_mapping.action_group.custom"
+        case .combinations: return "action.combination_action"
         case .commonPhrases: return "common_phrases.title"
         case .applications: return "button_mapping.action_group.applications"
         }
@@ -873,6 +938,18 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     case commandFind
     case commandSave
     case commandDelete
+    /// 窗口与标签页的固定快捷键。遥控器没有键盘，这些组合此前只能靠
+    /// `customShortcut` 逐个录制，新增预设后可直接从动作列表选择。
+    case commandMinimize
+    case toggleFullScreen
+    case commandNewTab
+    case commandPreviousTab
+    case commandNextTab
+    case commandNextWindow
+    /// 隐藏/新建窗口。⌘H 与 ⌘M 的差别在于它是可逆的：⌘Tab 切回即恢复，
+    /// 这也是遥控器「临时挪开窗口」更实用的入口。
+    case commandHide
+    case commandNew
     case arrowUp
     case arrowDown
     case arrowLeft
@@ -887,6 +964,17 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     case showDesktop
     case contextMenu
     case appSwitcher
+    /// 系统窗口管理手势。这四项是 macOS 默认键盘快捷键，注入路径与既有
+    /// 固定组合完全一致；若用户在系统设置里改过对应快捷键，注入会失效，
+    /// 属于外部配置边界，不在应用内兜底。
+    case missionControl
+    case applicationWindows
+    case spaceLeft
+    case spaceRight
+    /// 系统级副作用动作：锁屏与系统截屏。两者都依赖 WindowServer 符号快捷键，
+    /// 注入方式与窗口手势一致（显式修饰键边沿）。
+    case lockScreen
+    case screenshot
     case volumeUp
     case volumeDown
     case volumeMute
@@ -920,21 +1008,29 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     func displayName(using localization: LocalizationStore) -> String {
         switch self {
         case .disabled: return localization.text("action.disabled")
-        case .escape: return "Escape"
-        case .returnKey: return "Return"
-        case .commandReturn: return "Command-Return"
-        case .shiftReturn: return "Shift-Return"
-        case .commandCopy: return "Command-C"
-        case .commandPaste: return "Command-V"
-        case .commandClose: return "Command-W"
-        case .commandQuit: return "Command-Q"
-        case .commandCut: return "Command-X"
-        case .commandSelectAll: return "Command-A"
-        case .commandUndo: return "Command-Z"
-        case .commandRedo: return "Command-Shift-Z"
-        case .commandFind: return "Command-F"
-        case .commandSave: return "Command-S"
+        case .escape: return localization.text("action.escape")
+        case .returnKey: return localization.text("action.return_key")
+        case .commandReturn: return localization.text("action.command_return")
+        case .shiftReturn: return localization.text("action.shift_return")
+        case .commandCopy: return localization.text("action.command_copy")
+        case .commandPaste: return localization.text("action.command_paste")
+        case .commandClose: return localization.text("action.command_close")
+        case .commandQuit: return localization.text("action.command_quit")
+        case .commandCut: return localization.text("action.command_cut")
+        case .commandSelectAll: return localization.text("action.command_select_all")
+        case .commandUndo: return localization.text("action.command_undo")
+        case .commandRedo: return localization.text("action.command_redo")
+        case .commandFind: return localization.text("action.command_find")
+        case .commandSave: return localization.text("action.command_save")
         case .commandDelete: return localization.text("action.command_delete")
+        case .commandMinimize: return localization.text("action.command_minimize")
+        case .toggleFullScreen: return localization.text("action.toggle_full_screen")
+        case .commandNewTab: return localization.text("action.command_new_tab")
+        case .commandPreviousTab: return localization.text("action.command_previous_tab")
+        case .commandNextTab: return localization.text("action.command_next_tab")
+        case .commandNextWindow: return localization.text("action.command_next_window")
+        case .commandHide: return localization.text("action.command_hide")
+        case .commandNew: return localization.text("action.command_new")
         case .arrowUp: return localization.text("action.arrow_up")
         case .arrowDown: return localization.text("action.arrow_down")
         case .arrowLeft: return localization.text("action.arrow_left")
@@ -948,7 +1044,13 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .deleteBackward: return localization.text("action.delete_backspace")
         case .showDesktop: return localization.text("action.show_desktop")
         case .contextMenu: return localization.text("action.context_menu")
-        case .appSwitcher: return "Command-Tab"
+        case .appSwitcher: return localization.text("action.app_switcher")
+        case .missionControl: return localization.text("action.mission_control")
+        case .applicationWindows: return localization.text("action.application_windows")
+        case .spaceLeft: return localization.text("action.space_left")
+        case .spaceRight: return localization.text("action.space_right")
+        case .lockScreen: return localization.text("action.lock_screen")
+        case .screenshot: return localization.text("action.screenshot")
         case .volumeUp: return localization.text("action.system_volume_up")
         case .volumeDown: return localization.text("action.system_volume_down")
         case .volumeMute: return localization.text("action.system_mute")
@@ -1030,6 +1132,36 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
             return CustomKeyboardShortcut(keyCode: 1, modifierFlags: .command, keyLabel: "S")
         case .commandDelete:
             return CustomKeyboardShortcut(keyCode: 51, modifierFlags: .command, keyLabel: "Delete")
+        // 键码取 macOS ANSI 布局：M=46、F=3、T=17、[=33、]=30、`=50。
+        // ⌃⌘F 与系统的「切换全屏」菜单项一致；⌘` 走同一 App 的窗口循环。
+        case .commandMinimize:
+            return CustomKeyboardShortcut(keyCode: 46, modifierFlags: .command, keyLabel: "M")
+        case .toggleFullScreen:
+            return CustomKeyboardShortcut(
+                keyCode: 3,
+                modifierFlags: [.control, .command],
+                keyLabel: "F"
+            )
+        case .commandNewTab:
+            return CustomKeyboardShortcut(keyCode: 17, modifierFlags: .command, keyLabel: "T")
+        case .commandPreviousTab:
+            return CustomKeyboardShortcut(
+                keyCode: 33,
+                modifierFlags: [.shift, .command],
+                keyLabel: "["
+            )
+        case .commandNextTab:
+            return CustomKeyboardShortcut(
+                keyCode: 30,
+                modifierFlags: [.shift, .command],
+                keyLabel: "]"
+            )
+        case .commandNextWindow:
+            return CustomKeyboardShortcut(keyCode: 50, modifierFlags: .command, keyLabel: "`")
+        case .commandHide:
+            return CustomKeyboardShortcut(keyCode: 4, modifierFlags: .command, keyLabel: "H")
+        case .commandNew:
+            return CustomKeyboardShortcut(keyCode: 45, modifierFlags: .command, keyLabel: "N")
         case .arrowUp:
             return CustomKeyboardShortcut(keyCode: 126, modifierFlags: [], keyLabel: "Up")
         case .arrowDown:
@@ -1044,6 +1176,27 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
             return CustomKeyboardShortcut(keyCode: 103, modifierFlags: .function, keyLabel: "F11")
         case .appSwitcher:
             return CustomKeyboardShortcut(keyCode: 48, modifierFlags: .command, keyLabel: "Tab")
+        // 系统默认快捷键：⌃↑ 调度中心、⌃↓ 应用程序窗口、⌃←/⌃→ 切换桌面空间。
+        case .missionControl:
+            return CustomKeyboardShortcut(keyCode: 126, modifierFlags: .control, keyLabel: "Up")
+        case .applicationWindows:
+            return CustomKeyboardShortcut(keyCode: 125, modifierFlags: .control, keyLabel: "Down")
+        case .spaceLeft:
+            return CustomKeyboardShortcut(keyCode: 123, modifierFlags: .control, keyLabel: "Left")
+        case .spaceRight:
+            return CustomKeyboardShortcut(keyCode: 124, modifierFlags: .control, keyLabel: "Right")
+        case .lockScreen:
+            return CustomKeyboardShortcut(
+                keyCode: 12,
+                modifierFlags: [.control, .command],
+                keyLabel: "Q"
+            )
+        case .screenshot:
+            return CustomKeyboardShortcut(
+                keyCode: 20,
+                modifierFlags: [.shift, .command],
+                keyLabel: "3"
+            )
         default:
             return nil
         }
@@ -1076,14 +1229,22 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .disabled, .escape, .returnKey, .commandReturn, .shiftReturn, .commandCopy,
              .commandPaste, .commandClose, .commandQuit, .commandCut, .commandSelectAll,
              .commandUndo, .commandRedo, .commandFind, .commandSave, .commandDelete,
+             .commandMinimize, .toggleFullScreen, .commandNewTab, .commandPreviousTab,
+             .commandNextTab, .commandNextWindow, .commandHide, .commandNew,
              .arrowUp, .arrowDown, .arrowLeft, .arrowRight, .scrollUp, .scrollDown,
              .pageUp, .pageDown, .scrollToTop, .scrollToBottom, .deleteBackward:
             return .basicKeys
-        case .showDesktop, .contextMenu, .appSwitcher, .volumeUp, .volumeDown, .volumeMute,
+        case .showDesktop, .contextMenu, .appSwitcher, .missionControl, .applicationWindows,
+             .spaceLeft, .spaceRight, .lockScreen, .screenshot,
+             .volumeUp, .volumeDown, .volumeMute,
              .playPause, .previousCommandLeft, .nextCommandRight, .toggleLongRecording:
             return .systemAndMedia
-        case .customShortcut, .combinationAction, .focusInput:
+        case .customShortcut:
+            return .customShortcuts
+        case .focusInput:
             return .custom
+        case .combinationAction:
+            return .combinations
         case .openCommonPhrases:
             return .commonPhrases
         case .openCustomApplication:
@@ -1116,6 +1277,26 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
             .commandFind,
             .commandSave,
             .commandDelete,
+            // 窗口与标签页动作都是"一次操作一个结果"，按住连发会把窗口
+            // 反复最小化、或瞬间开出十几个标签页，因此与既有固定快捷键
+            // 一样只执行一次。
+            .commandMinimize,
+            .toggleFullScreen,
+            .commandNewTab,
+            .commandPreviousTab,
+            .commandNextTab,
+            .commandNextWindow,
+            // ⌘H / ⌘N 与系统手势同属"一次操作一个结果"：连发只会把窗口反复隐藏，
+            // 或在调度中心/桌面空间之间飞速来回切。
+            .commandHide,
+            .commandNew,
+            .missionControl,
+            .applicationWindows,
+            .spaceLeft,
+            .spaceRight,
+            // 锁屏与截屏都是一次性系统副作用：连发只会反复锁屏、或瞬间堆出十几张截图。
+            .lockScreen,
+            .screenshot,
             .previousCommandLeft,
             .nextCommandRight,
         ].contains(self) && presetApplication == nil && !isAppInternal

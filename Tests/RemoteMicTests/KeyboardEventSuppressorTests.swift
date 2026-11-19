@@ -6,6 +6,38 @@ import Testing
 
 @Suite("Keyboard event suppressor")
 struct KeyboardEventSuppressorTests {
+    @Test func capsLockPassesThroughWithoutConsumingArmedMediaKeys() throws {
+        var logs: [String] = []
+        let suppressor = KeyboardEventSuppressor(logger: { logs.append($0) })
+        suppressor.arm(nativeEvents: [.systemKey(type: 0)], edge: .down)
+        let capsLock = try #require(NSEvent.otherEvent(
+            with: .systemDefined, location: .zero, modifierFlags: .capsLock,
+            timestamp: 1, windowNumber: 0, context: nil,
+            subtype: 8, data1: (4 << 16) | (0xB << 8), data2: -1
+        )?.cgEvent)
+        let volumeDown = try nativeEvent(.systemKey(type: 0), down: true)
+        let completed = EventTapRunLoop.shared.performAndWait {
+            #expect(!suppressor.handle(type: capsLock.type, event: capsLock))
+            #expect(suppressor.handle(type: volumeDown.type, event: volumeDown))
+        }
+        #expect(completed)
+        #expect(logs.contains { $0.contains("HID FILTER suppressed event=sys0 edge=down") })
+        #expect(capsLock.type.rawValue == NSEvent.EventType.systemDefined.rawValue)
+    }
+
+    @Test func otherSystemMessagesDoNotConsumeArmedMediaKeys() throws {
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        suppressor.arm(nativeEvents: [.systemKey(type: 0)], edge: .down)
+        let other = try #require(NSEvent.otherEvent(
+            with: .systemDefined, location: .zero, modifierFlags: [],
+            timestamp: 1, windowNumber: 0, context: nil,
+            subtype: 7, data1: 0xA00, data2: -1
+        )?.cgEvent)
+        #expect(!suppressor.handle(type: other.type, event: other))
+        let volumeDown = try nativeEvent(.systemKey(type: 0), down: true)
+        #expect(suppressor.handle(type: volumeDown.type, event: volumeDown))
+    }
+
     @Test(arguments: [RemoteNativeEvent.systemKey(type: 0), .systemKey(type: 1), .systemKey(type: 16), .keyboard(keyCode: 115), .keyboard(keyCode: 36)])
     func delayedNativePairRemainsOwnedAfterRemoteRelease(_ native: RemoteNativeEvent) throws {
         var now: TimeInterval = 10
@@ -202,12 +234,86 @@ struct KeyboardEventSuppressorTests {
         #expect(suppressor.handle(type: up.type, event: up))
     }
 
+    /// 键盘描述符（方向键、回车）与音量键共用同一本「已放行」账本。
+    /// Intel 方向键泄漏时会先放行原生 down，随后主线程才 `arm(edge: .up)`；
+    /// 只放行 down 会吞掉 up，系统据此认为键仍按住并继续连发。
+    @Test(arguments: [UInt16(123), UInt16(36)], [false, true])
+    func escapedKeyboardDownKeepsItsReleaseAndDoesNotStealTheNextPress(
+        _ keyCode: UInt16, _ nativeReleaseFirst: Bool
+    ) throws {
+        var now: TimeInterval = 10
+        let native = RemoteNativeEvent.keyboard(keyCode: keyCode)
+        var logs: [String] = []
+        let suppressor = KeyboardEventSuppressor(uptime: { now }, logger: { logs.append($0) })
+        let down = try nativeEvent(native, down: true)
+        let up = try nativeEvent(native, down: false)
+
+        #expect(!suppressor.handle(type: down.type, event: down))
+        now += 0.011
+        suppressor.arm(nativeEvents: [native], edge: .down)
+        now += 0.15
+        if nativeReleaseFirst {
+            #expect(!suppressor.handle(type: up.type, event: up))
+            suppressor.arm(nativeEvents: [native], edge: .up)
+        } else {
+            suppressor.arm(nativeEvents: [native], edge: .up)
+            #expect(!suppressor.handle(type: up.type, event: up))
+        }
+        #expect(logs.contains { $0.contains("edge=up reason=escaped_native_pair") })
+
+        // 这一对关闭后，遥控器的下一次按下必须恢复拦截。
+        now += 0.25
+        suppressor.arm(nativeEvents: [native], edge: .down)
+        #expect(suppressor.handle(type: down.type, event: down))
+        suppressor.arm(nativeEvents: [native], edge: .up)
+        #expect(suppressor.handle(type: up.type, event: up))
+    }
+
+    /// 纯实体键盘的同码按键不是泄漏配对：不能为每次打字在 runtime.log 里写
+    /// `passed_through` 日志。放行本身不变，只是不再记日志。
+    @Test func physicalKeyboardTypingDoesNotLogPassedThrough() throws {
+        var logs: [String] = []
+        let suppressor = KeyboardEventSuppressor(logger: { logs.append($0) })
+        let native = RemoteNativeEvent.keyboard(keyCode: 36)
+        let down = try nativeEvent(native, down: true)
+        let up = try nativeEvent(native, down: false)
+
+        #expect(!suppressor.handle(type: down.type, event: down))
+        #expect(!suppressor.handle(type: up.type, event: up))
+        #expect(!logs.contains { $0.contains("passed_through") })
+    }
+
+    /// 实体键盘的同码键仍按住时，遥控器这一次按下放弃事件级登记——判据不变，
+    /// 但日志必须给出独立原因码，现场才能把「双跳重现」对应到「键盘同码键未松开」。
+    @Test(arguments: [UInt16(123), UInt16(36)])
+    func heldSameKeyArmKeepsItsBehaviorAndLogsItsOwnReason(_ keyCode: UInt16) throws {
+        var now: TimeInterval = 10
+        let native = RemoteNativeEvent.keyboard(keyCode: keyCode)
+        var logs: [String] = []
+        let suppressor = KeyboardEventSuppressor(uptime: { now }, logger: { logs.append($0) })
+        let down = try nativeEvent(native, down: true)
+
+        // 实体键先按下：不是泄漏配对，既不放行日志也不写 held_same_key。
+        #expect(!suppressor.handle(type: down.type, event: down))
+        #expect(!logs.contains { $0.contains("reason=held_same_key") })
+
+        // 遥控器同码按下：放弃登记的行为不变（放行，不产生待匹配记录），
+        // 但要留下独立原因码，且只留一行。
+        suppressor.arm(nativeEvents: [native], edge: .down)
+        let heldLogs = logs.filter { $0.contains("reason=held_same_key") }
+        #expect(heldLogs.count == 1)
+        #expect(heldLogs.allSatisfy {
+            $0.contains("phase=arm result=passthrough") && $0.contains("edge=down")
+        })
+        #expect(!suppressor.handle(type: down.type, event: down))
+    }
+
     @Test(arguments: [RemoteButton.volumeUp, .volumeDown, .tv], [false, true])
     func managedNativeKeysAreArmedBeforeReportDiagnosticsAndConfigurationCallbacks(
         _ button: RemoteButton, _ isSeized: Bool
     ) throws {
         let suite = "KeyboardEventSuppressorTests.earlyVolume.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -251,7 +357,7 @@ struct KeyboardEventSuppressorTests {
         _ button: RemoteButton, _ disconnectWhileHeld: Bool
     ) throws {
         let suite = "KeyboardEventSuppressorTests.sourceNeutralized.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -297,7 +403,7 @@ struct KeyboardEventSuppressorTests {
     @Test(arguments: [RemoteButton.volumeUp, .volumeDown, .tv])
     func sourceMappingDoesNotDisableNativeSuppression(_ button: RemoteButton) throws {
         let suite = "KeyboardEventSuppressorTests.sourceMappingFallback.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -330,7 +436,7 @@ struct KeyboardEventSuppressorTests {
     @Test(arguments: [RemoteButton.left, .right])
     func sourceIsolatedDefaultArrowsAreExecutedInsteadOfWaitingForNativePassthrough(_ button: RemoteButton) throws {
         let suite = "KeyboardEventSuppressorTests.defaultArrows.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -348,6 +454,254 @@ struct KeyboardEventSuppressorTests {
         monitor.handleSimulatedReport(reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0]))
         monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
         #expect(performed == 1)
+        monitor.disconnectSimulatedDevice()
+    }
+
+    /// Intel 现场（2026-11-07）：独占打开失败后走 monitored，源头映射回读一致，
+    /// 但系统仍会投递原生方向键；主线程登记晚于该事件约 200 ms，于是 App 自己
+    /// 注入的一次移动 + 泄漏的一次移动 = 光标跳过两格。方向键必须和 TV、音量
+    /// 一样保留事件级兜底。
+    @Test(arguments: [RemoteButton.left, .right, .up, .down])
+    func monitoredDirectionalPressOwnsItsLeakedNativeEvent(_ button: RemoteButton) throws {
+        let suite = "KeyboardEventSuppressorTests.directionalLeak.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        let action: ButtonAction = switch button {
+        case .left: .arrowLeft
+        case .right: .arrowRight
+        case .up: .arrowUp
+        default: .arrowDown
+        }
+        settings.setAction(action, for: button)
+        settings.setAction(.disabled, for: button, trigger: .doubleClick)
+        settings.setAction(.disabled, for: button, trigger: .longPress)
+        settings.setAllowsRapidPress(true, for: button)
+        let native = try #require(button.nativeEvent)
+        let down = try nativeEvent(native, down: true)
+        let up = try nativeEvent(native, down: false)
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        var performed: [ButtonAction] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings, eventSuppressor: suppressor, ownsEventSuppressor: false,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, configured in performed.append(configured.action); return true },
+            frontmostBundleIdentifier: { PresetApplication.safari.bundleIdentifier },
+            diagnosticLogger: { _ in }, prepareNativeKeys: { true },
+            directionalNativeFallback: true
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "intel-monitored-directional",
+            profileID: settings.selectedRemoteProfileID,
+            isSeized: false
+        ))
+        defer { monitor.disconnectSimulatedDevice() }
+
+        monitor.handleSimulatedReport(reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0]))
+        // 一次按下只允许一次移动：泄漏的原生按下必须被吞掉。
+        #expect(suppressor.handle(type: down.type, event: down))
+        monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        #expect(suppressor.handle(type: up.type, event: up))
+        #expect(performed == [action])
+    }
+
+    /// 反向边界：源头映射未生效的 monitored 会话里，默认左右动作故意交给系统
+    /// 原生事件执行。此时若抢先登记，唯一一次移动会被吞掉，按键完全没有反应。
+    @Test func monitoredPassthroughKeepsTheNativeArrowAsTheOnlyMove() throws {
+        let suite = "KeyboardEventSuppressorTests.directionalPassthrough.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.arrowLeft, for: .left)
+        settings.setAction(.disabled, for: .left, trigger: .doubleClick)
+        settings.setAction(.disabled, for: .left, trigger: .longPress)
+        let native = try #require(RemoteButton.left.nativeEvent)
+        let down = try nativeEvent(native, down: true)
+        let up = try nativeEvent(native, down: false)
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        var performed = 0
+        let monitor = HIDRemoteMonitor(
+            settings: settings, eventSuppressor: suppressor, ownsEventSuppressor: false,
+            runtimePermissions: { true }, actionPerformer: { _, _, _ in performed += 1; return true },
+            frontmostBundleIdentifier: { PresetApplication.safari.bundleIdentifier },
+            diagnosticLogger: { _ in }
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "monitored-passthrough",
+            profileID: settings.selectedRemoteProfileID,
+            isSeized: false
+        ))
+        defer { monitor.disconnectSimulatedDevice() }
+
+        monitor.handleSimulatedReport(reportID: 1, data: Data([UInt8(RemoteButton.left.hidUsage), 0, 0, 0, 0, 0]))
+        #expect(!suppressor.handle(type: down.type, event: down))
+        monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        #expect(!suppressor.handle(type: up.type, event: up))
+        #expect(performed == 0)
+    }
+
+    /// 反向边界：没有泄漏证据的构建（Apple Silicon 默认）不得为方向键开拦截窗口。
+    /// 窗口内按下的实体键盘方向键会被吞掉一次，极端情况下只吞掉 keyUp，
+    /// 系统会认为该键仍然按下并继续连发。
+    @Test(arguments: [RemoteButton.left, .right, .up, .down])
+    func directionalFallbackKeepsNonLeakingBuildsFreeOfSuppressionWindows(
+        _ button: RemoteButton
+    ) throws {
+        let suite = "KeyboardEventSuppressorTests.directionalFallbackOff.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        let action: ButtonAction = switch button {
+        case .left: .arrowLeft
+        case .right: .arrowRight
+        case .up: .arrowUp
+        default: .arrowDown
+        }
+        settings.setAction(action, for: button)
+        settings.setAction(.disabled, for: button, trigger: .doubleClick)
+        settings.setAction(.disabled, for: button, trigger: .longPress)
+        settings.setAllowsRapidPress(true, for: button)
+        let native = try #require(button.nativeEvent)
+        let down = try nativeEvent(native, down: true)
+        let up = try nativeEvent(native, down: false)
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        var performed = 0
+        let monitor = HIDRemoteMonitor(
+            settings: settings, eventSuppressor: suppressor, ownsEventSuppressor: false,
+            runtimePermissions: { true }, actionPerformer: { _, _, _ in performed += 1; return true },
+            frontmostBundleIdentifier: { PresetApplication.safari.bundleIdentifier },
+            diagnosticLogger: { _ in }, prepareNativeKeys: { true },
+            directionalNativeFallback: false
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "apple-silicon-directional",
+            profileID: settings.selectedRemoteProfileID,
+            isSeized: false
+        ))
+        defer { monitor.disconnectSimulatedDevice() }
+
+        monitor.handleSimulatedReport(reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0]))
+        #expect(!suppressor.handle(type: down.type, event: down))
+        monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        #expect(!suppressor.handle(type: up.type, event: up))
+        #expect(performed == 1)
+    }
+
+    /// 映射未生效（monitored、回读未通过）时方向键本来就没有源头隔离，登记是修复前
+    /// 就有的行为。兜底开关只决定「映射已生效」那一段，不能把它一起关掉，
+    /// 否则自定义快捷键会和泄漏的原生方向键同时生效。
+    @Test(arguments: [RemoteButton.left, .right])
+    func unneutralizedDirectionalKeepsItsArmingWithoutTheFallback(_ button: RemoteButton) throws {
+        let suite = "KeyboardEventSuppressorTests.unneutralizedDirectional.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.customShortcut, for: button)
+        settings.setShortcut(
+            CustomKeyboardShortcut(keyCode: 43, modifierFlags: [], keyLabel: ","), for: button
+        )
+        settings.setAction(.disabled, for: button, trigger: .doubleClick)
+        settings.setAction(.disabled, for: button, trigger: .longPress)
+        settings.setAllowsRapidPress(true, for: button)
+        let native = try #require(button.nativeEvent)
+        let down = try nativeEvent(native, down: true)
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        var performed = 0
+        let monitor = HIDRemoteMonitor(
+            settings: settings, eventSuppressor: suppressor, ownsEventSuppressor: false,
+            runtimePermissions: { true }, actionPerformer: { _, _, _ in performed += 1; return true },
+            frontmostBundleIdentifier: { PresetApplication.safari.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            directionalNativeFallback: false
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "unneutralized-directional",
+            profileID: settings.selectedRemoteProfileID,
+            isSeized: false
+        ))
+        defer { monitor.disconnectSimulatedDevice() }
+
+        monitor.handleSimulatedReport(reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0]))
+        // 没有兜底开关也要拦：这条路径与修复前一致。
+        #expect(suppressor.handle(type: down.type, event: down))
+        #expect(performed == 1)
+    }
+
+    @Test func directionalPrearmOnlyCoversSessionsWhereTheAppOwnsTheMove() {
+        // 报告线程提前登记的范围：Intel 上映射回读一致、非独占时，原生方向键
+        // 仍会先于主线程登记到达，必须提前拦。
+        for button in [RemoteButton.up, .down, .left, .right] {
+            #expect(HIDRemoteMonitor.prearmsNativeEvent(
+                for: button, seized: false, neutralized: true, directionalFallback: true
+            ), Comment(rawValue: button.rawValue))
+        }
+        // 映射未生效的 monitored 会话靠原生透传移动，不能抢先登记。
+        #expect(!HIDRemoteMonitor.prearmsNativeEvent(
+            for: .left, seized: false, neutralized: false, directionalFallback: true
+        ))
+        // 独占时系统收不到原生事件，不需要登记。
+        #expect(!HIDRemoteMonitor.prearmsNativeEvent(
+            for: .left, seized: true, neutralized: true, directionalFallback: true
+        ))
+        // Apple Silicon 等没有泄漏证据的构建不登记，避免开出吞掉键盘方向键的窗口。
+        #expect(!HIDRemoteMonitor.prearmsNativeEvent(
+            for: .left, seized: false, neutralized: true, directionalFallback: false
+        ))
+        // TV 与音量沿用原有范围：始终由 App 执行，与方向键开关无关。
+        for button in [RemoteButton.tv, .volumeUp, .volumeDown] {
+            #expect(HIDRemoteMonitor.prearmsNativeEvent(
+                for: button, seized: false, neutralized: false, directionalFallback: false
+            ), Comment(rawValue: button.rawValue))
+            #expect(!HIDRemoteMonitor.prearmsNativeEvent(
+                for: button, seized: true, neutralized: true, directionalFallback: true
+            ), Comment(rawValue: button.rawValue))
+        }
+        // 其余普通键不提前登记，避免吞掉实体键盘的同码按键。
+        #expect(!HIDRemoteMonitor.prearmsNativeEvent(
+            for: .ok, seized: false, neutralized: true, directionalFallback: true
+        ))
+        #expect(!HIDRemoteMonitor.prearmsNativeEvent(
+            for: .home, seized: false, neutralized: true, directionalFallback: true
+        ))
+    }
+
+    /// 设备匹配成功、但原生键映射校验没过时必须回报一次：上层靠它排重试。
+    /// 2026-11-13 的 Intel 现场只有一次 `reason=no_service`，之后设备永久不被接管，
+    /// 语音键的 F5→Fn 映射再也没写回去，原生 F5 直接进了系统。
+    @Test func nativeMappingVerificationFailureIsReportedOncePerAttempt() throws {
+        let suite = "KeyboardEventSuppressorTests.nativeMappingFailure.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        var serviceReady = false
+        var failures = 0
+        let monitor = HIDRemoteMonitor(
+            settings: settings, eventSuppressor: suppressor, ownsEventSuppressor: false,
+            runtimePermissions: { true }, actionPerformer: { _, _, _ in true },
+            frontmostBundleIdentifier: { PresetApplication.safari.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            prepareNativeKeys: { serviceReady }
+        )
+        monitor.onNativeMappingVerificationFailed = { failures += 1 }
+
+        // 服务还没枚举出来：连接被拒，同时回报一次。
+        #expect(!monitor.connectSimulatedDevice(
+            fingerprint: "service-pending", profileID: settings.selectedRemoteProfileID
+        ))
+        #expect(failures == 1)
+
+        // 服务就绪后校验通过，不应再回报——否则会无谓重启整套 HID 监视。
+        serviceReady = true
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "service-ready", profileID: settings.selectedRemoteProfileID
+        ))
+        #expect(failures == 1)
         monitor.disconnectSimulatedDevice()
     }
 
@@ -388,6 +742,29 @@ struct KeyboardEventSuppressorTests {
         now += 0.6
         #expect(!suppressor.handle(type: down.type, event: down))
         #expect(!suppressor.handle(type: up.type, event: up))
+    }
+
+    /// 本 Bug 的真实顺序：报告线程的提前登记必须早于主线程的 `arm` 生效。
+    /// 这里按现场顺序喂事件（prearm → 原生 down → 主线程 arm），确认方向键走的是
+    /// 提前登记这条路径，而不是「有没有登记」这种主线程也能满足的判据。
+    @Test func prearmedDirectionalDownBeatsTheMainThreadArm() throws {
+        var logs: [String] = []
+        let suppressor = KeyboardEventSuppressor(logger: { logs.append($0) })
+        suppressor.setPrearmActiveForTesting(true)
+        let native = RemoteNativeEvent.keyboard(keyCode: 123)
+        let down = try nativeEvent(native, down: true)
+        let up = try nativeEvent(native, down: false)
+
+        suppressor.prearm(nativeEvents: [native])
+        #expect(suppressor.handle(type: down.type, event: down))
+        #expect(logs.contains {
+            $0.contains("HID FILTER suppressed") && $0.contains("armed_by=prearm")
+        })
+
+        // 主线程随后登记同一次按下/松开，不得留下会吞掉下一次实体键盘按键的记录。
+        suppressor.arm(nativeEvents: [native], edge: .down)
+        suppressor.arm(nativeEvents: [native], edge: .up)
+        #expect(suppressor.handle(type: up.type, event: up))
     }
 
     @Test(arguments: [Int32(0), Int32(1)])
@@ -642,5 +1019,79 @@ struct KeyboardEventSuppressorTests {
                 now: 12
             )
         )
+    }
+
+    // MARK: - 切换器会话的诊断量
+
+    @Test func switcherRepeatsAreCountedInsteadOfWrittenPerRepeat() {
+        // 方向键连发 100ms 一次，而且每次成功都会重置 15 秒会话超时，所以按住不放
+        // 就是一直写。这类重复动作没有逐条诊断价值，只应该累加到会话汇总里。
+        var policy = AppSwitcherDiagnosticPolicy()
+        for _ in 1...600 {
+            policy.recordRepeat(button: "left")
+        }
+        policy.recordRepeat(button: "right")
+        #expect(policy.repeatCount == 601)
+        // 「哪个方向」这个信息不能因为不逐条写就丢掉。
+        #expect(policy.repeatBreakdown == "left:600,right:1")
+        // 连发不产生任何状态行。
+        #expect(policy.stateLineCount == 0)
+        #expect(policy.statePollCount == 0)
+    }
+
+    @Test func switcherRepeatBreakdownIsStableWhenNothingRepeats() {
+        let policy = AppSwitcherDiagnosticPolicy()
+        #expect(policy.repeatCount == 0)
+        #expect(policy.repeatBreakdown == "none")
+    }
+
+    @Test func switcherStateIsWrittenOnlyWhenTheStableSignalChanges() {
+        var policy = AppSwitcherDiagnosticPolicy()
+        var written = 0
+        // 30 次轮询都报同一份状态：切换器可见、Dock 窗口数高于基线。
+        for _ in 1...30 {
+            if policy.recordStatePoll(signature: "visible|above") { written += 1 }
+        }
+        #expect(written == 1)
+        #expect(policy.statePollCount == 30)
+        #expect(policy.stateLineCount == 1)
+
+        // 真的变了才再写一行。
+        let changed = policy.recordStatePoll(signature: "hidden|at")
+        #expect(changed)
+        #expect(policy.stateLineCount == 2)
+    }
+
+    @Test func switcherStateLinesAreCappedPerSession() {
+        // 两个信号本身会在区间内来回跳（macOS 13 真机日志：19/22 次会话在 1 秒内
+        // 被误判成“已关闭”），所以只靠变化判定仍然可能每 tick 一行，必须有上限。
+        var policy = AppSwitcherDiagnosticPolicy()
+        var written = 0
+        for index in 1...200 {
+            let signature = index.isMultiple(of: 2) ? "visible|above" : "hidden|at"
+            if policy.recordStatePoll(signature: signature) { written += 1 }
+        }
+        #expect(written == AppSwitcherDiagnosticPolicy.maximumStateLines)
+        #expect(policy.statePollCount == 200)
+        #expect(policy.stateLineCount == AppSwitcherDiagnosticPolicy.maximumStateLines)
+    }
+
+    @Test func switcherEndedLineCarriesTheSessionTotals() throws {
+        // 连发与状态轮询都改成计数后，这些数字必须真的落到收尾那一行，
+        // 否则现场只剩一条「ended」，看不出会话里到底发生了什么。
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent(
+            "Sources/RemoteMic/HIDRemoteMonitor.swift"
+        ), encoding: .utf8)
+        #expect(source.contains("repeat_count=\\(appSwitcherDiagnostics.repeatCount)"))
+        #expect(source.contains("repeat_buttons=\\(appSwitcherDiagnostics.repeatBreakdown)"))
+        #expect(source.contains("state_polls=\\(appSwitcherDiagnostics.statePollCount)"))
+        #expect(source.contains("state_lines=\\(appSwitcherDiagnostics.stateLineCount)"))
+        // 逐条连发日志已经移除，别再被加回来。
+        #expect(!source.contains("phase=repeat success=true"))
+        // 状态轮询必须经过限流，不能直接写。
+        #expect(source.contains("appSwitcherDiagnostics.recordStatePoll("))
+        #expect(source.contains("appSwitcherDiagnostics = AppSwitcherDiagnosticPolicy()"))
     }
 }

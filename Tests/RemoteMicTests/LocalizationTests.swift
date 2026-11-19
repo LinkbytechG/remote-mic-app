@@ -14,16 +14,53 @@ struct LocalizationTests {
             ) as? [String: String])
             #expect(copy["onboarding.control_source.siri_remote.detail"]?.contains(language == "en" ? "membership" : "会员") == true)
             #expect(copy["onboarding.complete.siri_membership"]?.isEmpty == false)
-            for key in ["onboarding.voice_tool.guide.screenshot.doubao_settings", "onboarding.voice_tool.guide.screenshot.vokie_step_2"] {
+            for key in [
+                "onboarding.voice_tool.guide.screenshot.doubao_settings",
+                "onboarding.voice_tool.guide.screenshot.weixin_input_settings",
+                "onboarding.voice_tool.guide.screenshot.vokie_step_2",
+            ] {
                 #expect(copy[key]?.contains("SayAll") == true)
-                #expect(copy[key]?.contains("MiRemoteV 2ch") == true)
             }
+            #expect(copy["onboarding.voice_tool.guide.screenshot.vokie_step_2"]?
+                .contains("MiRemoteV 2ch") == true)
+            #expect(copy["onboarding.voice_tool.guide.screenshot.doubao_settings"]?
+                .contains("MiRemoteV 2ch") == false)
+            #expect(copy["onboarding.voice_tool.guide.screenshot.weixin_input_settings"]?
+                .contains(language == "en" ? "microphone" : "麦克风") == true)
+            #expect(copy["onboarding.voice_tool.guide.screenshot.feishu_settings_remove_shortcuts"]?
+                .contains(language == "en" ? "Feishu" : "飞书") == true)
         }
+    }
+
+    @Test func remoteCardStatusDetailsMatchTheApprovedDesign() throws {
+        let chinese = try strings(
+            at: repositoryRoot.appendingPathComponent("Resources/zh-Hans.lproj/Localizable.strings")
+        )
+        let english = try strings(
+            at: repositoryRoot.appendingPathComponent("Resources/en.lproj/Localizable.strings")
+        )
+        #expect(chinese["remote.card.detail.connected"] == "设备已连接，当前应当可用的按键和语音功能均正常。")
+        #expect(chinese["remote.card.detail.checking"] == "设备已连接，正在确认按键及已授权的语音功能；尚未确认一切正常。")
+        #expect(chinese["remote.card.detail.confirming"] == "设备已连接，正在确认功能状态；确认完成前不标记为正常。")
+        #expect(chinese["remote.card.detail.buttons_failed"] == "设备已连接，但按键功能出现问题。")
+        #expect(chinese["remote.card.detail.voice_failed"] == "设备已连接，但已授权的语音功能出现问题。")
+        #expect(chinese["remote.card.detail.device_failed"] == "设备已连接，但按键和已授权的语音功能均出现问题。")
+        #expect(chinese["remote.card.recover_voice"] == "恢复语音")
+        #expect(chinese["remote.card.recover_voice.help"] == "重新尝试启动语音输出")
+        #expect(english["remote.card.recover_voice"] == "Restore")
+        #expect(english["remote.card.recover_voice.help"] == "Restore Voice")
+        #expect(chinese["remote.card.detail.connected"]?.contains("第三方 App") == false)
+        #expect(english["remote.card.detail.connected"] == "Device connected. The button and voice functions that should be available are working normally.")
+        #expect(english["remote.card.detail.checking"] == "Device connected. Checking the buttons and entitled voice functions; not yet confirmed normal.")
+        #expect(english["remote.card.detail.confirming"] == "Device connected. Confirming functional status; not marked normal until confirmed.")
+        #expect(english["remote.card.detail.buttons_failed"] == "Device connected, but the buttons are not working.")
+        #expect(english["remote.card.detail.voice_failed"] == "Device connected, but the entitled voice function is not working.")
+        #expect(english["remote.card.detail.device_failed"] == "Device connected, but both the buttons and the entitled voice function are not working.")
     }
 
     @Test func screenshotResourceFallbackLoadsRepositoryLocalizations() throws {
         let suiteName = "RemoteMicTests.Localization.ScreenshotFallback.(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let settings = AppSettings(defaults: defaults)
@@ -41,7 +78,7 @@ struct LocalizationTests {
 
     @Test func languageSelectionPersistsAndUpdatesTheLocaleImmediately() throws {
         let suiteName = "RemoteMicTests.Localization.(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let settings = AppSettings(defaults: defaults)
@@ -114,7 +151,7 @@ struct LocalizationTests {
         )
         let englishInfo = try strings(at: englishDirectory.appendingPathComponent("InfoPlist.strings"))
 
-        #expect(english["action.command_delete"] == "Command-Delete")
+        #expect(english["action.command_delete"] == "Delete to Line Start")
         #expect(english["button_mapping.action_filter.all"] == "All")
         #expect(english["shortcut.editor.instructions"]?.contains("single key") == true)
         #expect(english["shortcut.editor.instructions"]?.contains("recorded alone") == true)
@@ -146,8 +183,8 @@ struct LocalizationTests {
                 entry.value.localizedCaseInsensitiveContains("voice tool")
         } == false)
         #expect(english["onboarding.voice_tool.system_fn.conflict"] == "The macOS Fn action needs to be changed")
-        #expect(english["remote.device.model.apple_siri_remote_a2854"] == "Apple Remote (7th Generation)")
-        #expect(english["remote.device.model.apple_siri_remote_a2540"] == "Apple Remote (6th Generation)")
+        #expect(english["remote.device.model.apple_siri_remote_a2854"] == "Apple Remote Type-C")
+        #expect(english["remote.device.model.apple_siri_remote_a2540"] == "Apple Remote Lightning")
         #expect(english["siri_remote.activation.open_membership"] == "Unlock membership feature")
         #expect(english["remote.button.full.play_pause"] == "Play/Pause")
         #expect(english["connection.web.title"] == "SayAll WeChat Mini Program")
@@ -170,7 +207,7 @@ struct LocalizationTests {
             let localized = try strings(at: directory.appendingPathComponent("Localizable.strings"))
             let localizedInfo = try strings(at: directory.appendingPathComponent("InfoPlist.strings"))
             if directory.lastPathComponent == "zh-Hans.lproj" {
-                #expect(localized["action.command_delete"] == "Command-Delete")
+                #expect(localized["action.command_delete"] == "删除到行首")
                 #expect(localized["button_mapping.action_filter.all"] == "全部")
                 #expect(localized["shortcut.editor.instructions"]?.contains("单个按键") == true)
                 #expect(localized["shortcut.editor.instructions"]?.contains("单独录入") == true)
@@ -184,8 +221,8 @@ struct LocalizationTests {
                 #expect(localized["onboarding.remote.voice_button_mistake.detail"] == "这一步检查普通控制键。请改为短按圆盘中间的确定键或任意方向键。")
                 #expect(localized["onboarding.voice_tool.weixin.title"] == "微信输入法")
                 #expect(localized["onboarding.voice_tool.system_fn.conflict"] == "系统仍在使用 Fn")
-                #expect(localized["remote.device.model.apple_siri_remote_a2854"] == "苹果遥控器第 7 代")
-                #expect(localized["remote.device.model.apple_siri_remote_a2540"] == "苹果遥控器第 6 代")
+                #expect(localized["remote.device.model.apple_siri_remote_a2854"] == "苹果遥控器 Type-C")
+                #expect(localized["remote.device.model.apple_siri_remote_a2540"] == "苹果遥控器 Lightning")
                 #expect(localized["siri_remote.activation.open_membership"] == "点击开通会员功能")
                 #expect(localized["connection.web.title"] == "无线麦 SayAll 微信小程序")
                 #expect(localized["connection.web.help_short"]?.contains("微信小程序") == false)
@@ -204,6 +241,29 @@ struct LocalizationTests {
                 #expect(!containsRestrictedUserTerm(localizedValue))
             }
         }
+    }
+
+    @Test func focusAndScrollingPageUsesClearNames() throws {
+        let localizationDirectories = try sourceLocalizationDirectories()
+        let englishDirectory = try #require(
+            localizationDirectories.first { $0.lastPathComponent == "en.lproj" }
+        )
+        let simplifiedChineseDirectory = try #require(
+            localizationDirectories.first { $0.lastPathComponent == "zh-Hans.lproj" }
+        )
+        let english = try strings(at: englishDirectory.appendingPathComponent("Localizable.strings"))
+        let chinese = try strings(
+            at: simplifiedChineseDirectory.appendingPathComponent("Localizable.strings")
+        )
+
+        #expect(chinese["settings.section.applications"] == "聚焦与翻页")
+        #expect(chinese["settings.section.applications.sidebar"] == "聚焦与翻页")
+        #expect(english["settings.section.applications"] == "Focus & Scrolling")
+        #expect(english["settings.section.applications.sidebar"] == "Focus/Scroll")
+        #expect(chinese["custom_application.page.subtitle"]?.contains("不会改变按键绑定") == true)
+        #expect(english["custom_application.page.subtitle"]?.contains("do not change button bindings") == true)
+        #expect(chinese["custom_application.bindings.title"] == "哪些按键会打开它")
+        #expect(english["custom_application.bindings.title"] == "Buttons that open it")
     }
 
     @Test func glossaryResourcesContainTheDocumentedTechnicalTerms() throws {
@@ -247,7 +307,7 @@ struct LocalizationTests {
 
         let bundle = try #require(Bundle(url: bundleURL))
         let suiteName = "RemoteMicTests.LocalizationFallback.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.applicationLanguage = .simplifiedChinese

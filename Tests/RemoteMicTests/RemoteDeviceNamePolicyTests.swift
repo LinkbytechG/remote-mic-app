@@ -104,20 +104,36 @@ struct RemoteDeviceNamePolicyTests {
         #expect(sorted.map(\.id) == [xiaomi.id, apple.id, chromecast.id])
     }
 
-    @Test func defaultMappingProfileUsesTheFirstXiaomiStyleRemote() throws {
-        let unknown = makeProfile(model: .unknown)
-        let apple = makeProfile(model: .appleSiriRemoteA2854)
-        let chromecast = makeProfile(model: .chromecastVoiceRemote)
-        let xiaomiPro = makeProfile(model: .rc003)
+    /// 上次选中的设备缺席时才回退，而且必须回退到实际在线的那台。
+    /// 用户卖掉小米、换用 Chromecast 时，不能永远停在已经不在的小米画布上。
+    @Test func fallbackSelectionUsesTheFirstConnectedRemote() throws {
         let xiaomi = makeProfile(model: .rc001)
+        let chromecast = makeProfile(model: .chromecastVoiceRemote)
 
-        let selected = try #require(RemoteDeviceNamePolicy.defaultMappingProfile(
-            from: [unknown, apple, chromecast, xiaomiPro, xiaomi]
+        // 两台都在线：按卡片顺序取小米。
+        let withXiaomi = try #require(RemoteDeviceNamePolicy.fallbackSelection(
+            from: [chromecast, xiaomi],
+            isConnected: { _ in true },
+            modelName: { _ in "" },
+            systemName: { $0.customName }
         ))
+        #expect(withXiaomi.id == xiaomi.id)
 
-        #expect(selected.id == xiaomiPro.id)
-        #expect(RemoteDeviceNamePolicy.defaultMappingProfile(
-            from: [unknown, apple, chromecast]
+        // 小米卖掉后只剩 Chromecast：必须回退到它。
+        let chromecastOnly = try #require(RemoteDeviceNamePolicy.fallbackSelection(
+            from: [xiaomi, chromecast],
+            isConnected: { $0.id == chromecast.id },
+            modelName: { _ in "" },
+            systemName: { $0.customName }
+        ))
+        #expect(chromecastOnly.id == chromecast.id)
+
+        // 一台都没连：没有可回退的目标，保持原样。
+        #expect(RemoteDeviceNamePolicy.fallbackSelection(
+            from: [xiaomi, chromecast],
+            isConnected: { _ in false },
+            modelName: { _ in "" },
+            systemName: { $0.customName }
         ) == nil)
     }
 
@@ -262,33 +278,71 @@ struct RemoteDeviceNamePolicyTests {
         }
     }
 
-    @Test func connectionSelectionNeverLetsChromecastTakeAConnectedXiaomiCanvas() {
-        // 多遥控器同时在线：已连接的小米是按键页优选画布，Chromecast 就绪不得抢占。
-        #expect(!RemoteDeviceNamePolicy.shouldAdoptConnectionSelection(
-            for: .chromecastVoiceRemote,
-            isAlreadySelected: false,
-            hasConnectedXiaomi: true
-        ))
-        // 没有小米在线时保持原有的「连接即选中」。
-        #expect(RemoteDeviceNamePolicy.shouldAdoptConnectionSelection(
-            for: .chromecastVoiceRemote,
-            isAlreadySelected: false,
-            hasConnectedXiaomi: false
-        ))
-        // 已经选中就不必再切一次。
-        #expect(!RemoteDeviceNamePolicy.shouldAdoptConnectionSelection(
-            for: .chromecastVoiceRemote,
-            isAlreadySelected: true,
-            hasConnectedXiaomi: false
-        ))
-        // 小米自己的链路与苹果遥控器不受这条 Chromecast 例外影响。
-        for model in [XiaomiRemoteModel.rc001, .rc003, .appleSiriRemoteA2854, .appleSiriRemoteA2540] {
-            #expect(RemoteDeviceNamePolicy.shouldAdoptConnectionSelection(
-                for: model,
-                isAlreadySelected: false,
-                hasConnectedXiaomi: true
-            ))
-        }
+    /// 现场数据的形状：同一台 Apple Remote 换过指纹，留下两条档案，两条都把序列号
+    /// 存成了设备名。卡片区只能出现一张，并且要留正在用的那条。
+    @Test func cardsCollapseRepeatedSerialAndPreferTheConnectedProfile() {
+        let connected = makeProfile(model: .appleSiriRemoteA2540, name: "DL1GHATQ17FC")
+        let stale = makeProfile(model: .appleSiriRemoteA2540, name: "DL1GHATQ17FC")
+        let other = makeProfile(model: .appleSiriRemoteA2854, name: "C08JV3H32330")
+
+        let cards = RemoteDeviceNamePolicy.cardsWithoutRepeatedSerial(
+            [stale, connected, other],
+            selectedProfileID: nil,
+            isConnected: { $0.id == connected.id },
+            systemName: { $0.customName.isEmpty ? nil : $0.customName }
+        )
+
+        #expect(cards.count == 2)
+        #expect(cards.first?.id == connected.id)
+        #expect(cards.contains { $0.id == other.id })
+    }
+
+    /// 两台序列号不同的遥控器必须各占一张卡片，否则会少一台设备的入口。
+    @Test func cardsKeepDifferentSerials() {
+        let first = makeProfile(model: .appleSiriRemoteA2540, name: "DL1GHATQ17FC")
+        let second = makeProfile(model: .appleSiriRemoteA2540, name: "C08JV3H32330")
+
+        let cards = RemoteDeviceNamePolicy.cardsWithoutRepeatedSerial(
+            [first, second],
+            selectedProfileID: nil,
+            isConnected: { _ in false },
+            systemName: { $0.customName }
+        )
+
+        #expect(cards.count == 2)
+    }
+
+    /// 只有「像序列号」的名字才当身份用；用户起的同名不算同一台设备。
+    @Test func cardsKeepRepeatedDisplayNamesThatAreNotSerials() {
+        let first = makeProfile(model: .appleSiriRemoteA2540, name: "客厅")
+        let second = makeProfile(model: .appleSiriRemoteA2540, name: "客厅")
+
+        let cards = RemoteDeviceNamePolicy.cardsWithoutRepeatedSerial(
+            [first, second],
+            selectedProfileID: nil,
+            isConnected: { _ in false },
+            systemName: { $0.customName }
+        )
+
+        #expect(cards.count == 2)
+    }
+
+    /// 正在编辑的那条不能被藏起来：否则页面在编辑一台卡片上看不到的设备，
+    /// 用户会以为刚配置的按键、键位方案丢了。
+    @Test func cardsNeverHideTheProfileBeingEdited() {
+        let connectedTwin = makeProfile(model: .appleSiriRemoteA2540, name: "DL1GHATQ17FC")
+        let editingTwin = makeProfile(model: .appleSiriRemoteA2540, name: "DL1GHATQ17FC")
+
+        let cards = RemoteDeviceNamePolicy.cardsWithoutRepeatedSerial(
+            [connectedTwin, editingTwin],
+            selectedProfileID: editingTwin.id,
+            isConnected: { $0.id == connectedTwin.id },
+            systemName: { $0.customName }
+        )
+
+        #expect(cards.count == 2)
+        #expect(cards.contains { $0.id == editingTwin.id })
+        #expect(cards.contains { $0.id == connectedTwin.id })
     }
 
     private func makeProfile(

@@ -76,7 +76,7 @@ ATVV 通道为：
 - `/Applications/SayAll.app`；
 - `/Library/Audio/Plug-Ins/HAL/MiRemoteV2ch.driver`。
 
-安装脚本校验架构、最低系统版本和签名，重启 CoreAudio，并为当前桌面用户启动应用。新 `SayAll.app` 验证通过后，Bundle ID 匹配的旧 `Remote Mic.app` / `无线麦.app` 会使用防冲突名称移入目标卷对应的 macOS 废纸篓；Trash 不可用或移动失败时旧 App 保持原样。卸载 PKG 只删除 `MiRemoteV2ch.driver` 并重启 CoreAudio，不删除应用或 BlackHole。
+安装脚本校验架构、最低系统版本和签名，并检查两个 HAL 目录链的所有权、权限与符号链接，再按 Bundle ID 枚举重复实例。可写 HAL 中属于本产品的多余副本会移入 root 废纸篓并强制重启 Core Audio；只读 System HAL 中的副本、符号链接、身份不可验证或目录权限异常会停止安装，不自动删除。安装成功后脚本重启 CoreAudio，并为当前桌面用户启动应用。新 `SayAll.app` 验证通过后，Bundle ID 匹配的旧 `Remote Mic.app` / `无线麦.app` 会使用防冲突名称移入目标卷对应的 macOS 废纸篓；Trash 不可用或移动失败时旧 App 保持原样。卸载 PKG 只删除 `MiRemoteV2ch.driver` 并重启 CoreAudio，不删除应用或 BlackHole。
 
 ## HID 与按键映射
 
@@ -116,7 +116,7 @@ Fn 层键位清单、修饰键标志位含义和快捷键注入的日志判读�
 
 ## 菜单栏与窗口
 
-应用以 `LSUIElement` accessory 模式运行，不显示 Dock 图标。状态栏按钮同时接收左右鼠标抬起事件：
+应用包声明 `LSUIElement`。运行时，Dock 偏好开启或设置窗口打开时使用 `.regular`，其余情况使用 `.accessory`。两个入口都关闭时，启动会打开设置窗口。状态栏按钮同时接收左右鼠标抬起事件。
 
 - 左键：创建或置前默认及最小尺寸为 1020×772 的可缩放设置窗口；
 - 右键：显示连接、音频、HID 状态，以及重新连接、打开设置、日志、关于、版本号、检查更新、GitHub 和退出菜单。
@@ -132,29 +132,27 @@ Fn 层键位清单、修饰键标志位含义和快捷键注入的日志判读�
 
 ## 构建与测试
 
-开发构建：
+公开开发自用构建：
 
 ```bash
 ./scripts/test.sh
 xcrun swift test --disable-keychain
-./scripts/build-app.sh
-./scripts/verify-app.sh
+SAYALL_PRIVATE_PLATFORM_MODE=public ./scripts/package-local-test-app.sh
 ```
 
 `scripts/test.sh` 运行协议/策略自检并编译完整应用；Swift Testing 继续覆盖 ATVV、蓝牙生命周期、音频设备策略、按键、权限、配置兼容、Fn 映射、Typeless 会话生命周期、pre-roll、音频排空和测试音。
 
-默认 checkout 是完整的公开构建路径：`Package.swift` 不解析私有依赖，没有私有仓库权限也可以执行上述测试、生成 `dist/SayAll.app` 并启动公开功能。官方 CI 先执行同一公开路径。私有 CI 再通过 `SAYALL_ENABLE_PRIVATE_SWIFTPM=1` 加载统一版本的私有平台根 Package，并单独加载私有 AI Package。私有源码只在私有 checkout 和受保护构建中解析。公开仓库和公开构件不包含私有源码。付费键位方案只由私有构建开关启用。受保护发布构建使用已校验的私有二进制构件。
+默认 checkout 是完整的公开构建路径：`Package.swift` 不解析私有依赖，没有私有仓库权限也可以执行上述测试、通过统一入口生成并安装 `~/Applications/SayAll.app`，递增本机构建号并启动公开功能。公开开发自用允许本机 ad-hoc 或 Developer ID 签名，包内记录 `SayAllBuildChannel=public`。默认没有私有输入时使用公开模式；既有私有输入调用继续使用 `required` 完整集成模式，要求固定私有预构件和 Developer ID。向他人分发按 `RELEASING.md` 执行签名与公证门禁。官方 CI 先执行同一公开路径。私有 CI 再通过 `SAYALL_ENABLE_PRIVATE_SWIFTPM=1` 加载统一版本的私有平台根 Package，并单独加载私有 AI Package。私有源码只在私有 checkout 和受保护构建中解析。公开仓库和公开构件不包含私有源码。付费键位方案只由私有构建开关启用。受保护发布构建使用已校验的私有二进制构件。
 
 常用语和 Siri Remote 均为会员功能。常用语实现由私有会员 Package 提供，使用权限由 `canUseCommonPhrases` 控制。Siri Remote 需要安装 PKG 可选组件，并在会员权益有效时由用户启用。公开构建成功、私有组件已集成或 PKG 组件已安装，都不等于获得会员使用权限。
 
 构建并启动应用：
 
 ```bash
-./script/build_and_run.sh
-./script/build_and_run.sh --verify
+SAYALL_PRIVATE_PLATFORM_MODE=public ./scripts/package-local-test-app.sh
 ```
 
-`--verify` 会构建、启动并确认 `RemoteMic` 进程存在；它不是遥控器或真实语音链路的硬件验收。
+设置 `SAYALL_LOCAL_DEFER_LAUNCH=1` 可只构建安装。CI 在独立目标目录执行同一入口，再启动本次产物并检查对应进程；该检查仅覆盖启动，遥控器和真实语音链路继续执行硬件验收。
 
 ## 发布产物
 

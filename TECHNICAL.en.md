@@ -77,7 +77,7 @@ The install PKG payload contains:
 - /Applications/SayAll.app
 - /Library/Audio/Plug-Ins/HAL/MiRemoteV2ch.driver
 
-Install scripts verify architecture, minimum system version, and code signature, restart Core Audio, and launch the app for the active desktop user. Legacy `/Applications/Remote Mic.app` and `/Applications/无线麦.app` bundles are moved to the target volume's macOS Trash only after the new SayAll.app is verified and each legacy Info.plist confirms the `com.hd838a.RemoteMic` bundle identifier. Collision-safe Trash names keep the old bundles recoverable; unavailable Trash or unrecognized content leaves the old path untouched. The uninstall PKG removes only MiRemoteV2ch.driver and restarts Core Audio.
+Install scripts verify architecture, minimum system version, and code signature; validate ownership, permissions, and symbolic links along both HAL directory chains; and enumerate duplicate bundles by bundle identifier. An extra copy of this product in the writable HAL scope is moved to root's Trash and Core Audio is restarted unconditionally; copies in the read-only System HAL, symbolic links, unverifiable identities, or unsafe directory permissions stop the installation without deleting anything. After a successful install the scripts restart Core Audio and launch the app for the active desktop user. Legacy `/Applications/Remote Mic.app` and `/Applications/无线麦.app` bundles are moved to the target volume's macOS Trash only after the new SayAll.app is verified and each legacy Info.plist confirms the `com.hd838a.RemoteMic` bundle identifier. Collision-safe Trash names keep the old bundles recoverable; unavailable Trash or unrecognized content leaves the old path untouched. The uninstall PKG removes only MiRemoteV2ch.driver and restarts Core Audio.
 
 ## HID and button mapping
 
@@ -115,7 +115,7 @@ Fn-layer key usages, modifier flag bits, and the log-reading rules for shortcut 
 
 ## Menu bar and window
 
-The app runs as an LSUIElement accessory and has no Dock icon. The status item receives left and right mouse-up events:
+The bundle declares `LSUIElement`. At runtime, SayAll uses `.regular` when the Dock preference is on or the settings window is open. Otherwise it uses `.accessory`. Launch opens Settings when both entry points are disabled. The status item receives left and right mouse-up events.
 
 - Left-click creates or brings forward the resizable settings window, whose default and minimum size is 1020×772.
 - Right-click shows connection, audio, and HID status plus reconnect, settings, logs, language, About, version, update, GitHub, and Quit actions.
@@ -135,21 +135,19 @@ Development verification:
 
     ./scripts/test.sh
     swift test --disable-keychain
-    ./scripts/build-app.sh
-    ./scripts/verify-app.sh
+    SAYALL_PRIVATE_PLATFORM_MODE=public ./scripts/package-local-test-app.sh
 
 `scripts/test.sh` runs protocol and policy self-tests and compiles the full app. Swift Testing covers ATVV, Bluetooth lifecycle, audio-device policy, button mapping, permissions, configuration compatibility, Fn mapping, the Typeless session lifecycle, pre-roll, audio draining, and test-tone behavior.
 
-The default checkout is the complete public build path. `Package.swift` does not resolve private dependencies, so contributors with public-repository access only can run the tests above, produce `dist/SayAll.app`, and launch the public functionality. Official CI runs that public path first. Private CI enables `SAYALL_ENABLE_PRIVATE_SWIFTPM=1`, loads the unified-version private platform root package, and loads the private AI package separately. Private source is resolved only in private checkouts and protected builds. Public source repositories and public artifacts contain no private source. Paid button profiles are enabled only by the private build switch. Protected release builds consume verified private binary artifacts.
+The default checkout is the complete public build path. `Package.swift` does not resolve private dependencies, so contributors with public-repository access only can run the tests above, use the unified packager to install `~/Applications/SayAll.app`, increment the local build number, and launch public functionality. Public development builds support local ad-hoc or Developer ID signing and record `SayAllBuildChannel=public`. With no private inputs, the default mode is public. Existing calls with private inputs retain the `required` integration mode, pinned private artifacts, and Developer ID signing. Assets distributed to others follow the signing and notarization gates in `RELEASING.md`. Official CI runs that public path first. Private CI enables `SAYALL_ENABLE_PRIVATE_SWIFTPM=1`, loads the unified-version private platform root package, and loads the private AI package separately. Private source is resolved only in private checkouts and protected builds. Public source repositories and public artifacts contain no private source. Paid button profiles are enabled only by the private build switch. Protected release builds consume verified private binary artifacts.
 
 Common Phrases and Siri Remote support require membership. The private membership package provides Common Phrases; `canUseCommonPhrases` controls access. Siri Remote requires its optional PKG component, valid membership access, and user activation in the app. A successful public build, private package integration, or component installation does not grant membership access.
 
 Build and launch:
 
-    ./script/build_and_run.sh
-    ./script/build_and_run.sh --verify
+    SAYALL_PRIVATE_PLATFORM_MODE=public ./scripts/package-local-test-app.sh
 
---verify builds, launches, and confirms that the RemoteMic process exists. It is not hardware acceptance for the remote or a real voice path.
+Set `SAYALL_LOCAL_DEFER_LAUNCH=1` to build and install without launching. CI uses the same packager with an isolated target, launches the resulting app, and checks its process. Hardware and voice acceptance require separate real-device evidence.
 
 ## Release artifacts
 

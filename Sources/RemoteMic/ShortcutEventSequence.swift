@@ -7,6 +7,19 @@ import Foundation
 final class ShortcutHardwareModifierState {
     private let lock = NSLock()
     private var functionKeyPressed: Bool?
+    private var functionKeyDownAt: TimeInterval?
+    private var functionKeyUpAt: TimeInterval?
+    private let uptime: () -> TimeInterval
+
+    init(uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.uptime = uptime
+    }
+
+    var functionObservationForDiagnostics: (down: TimeInterval?, up: TimeInterval?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (functionKeyDownAt, functionKeyUpAt)
+    }
 
     func observe(type: CGEventType, event: CGEvent) {
         guard type == .flagsChanged,
@@ -15,12 +28,20 @@ final class ShortcutHardwareModifierState {
         else { return }
         lock.lock()
         functionKeyPressed = event.flags.contains(.maskSecondaryFn)
+        if functionKeyPressed == true {
+            functionKeyDownAt = uptime()
+            functionKeyUpAt = nil
+        } else {
+            functionKeyUpAt = uptime()
+        }
         lock.unlock()
     }
 
     func reset() {
         lock.lock()
         functionKeyPressed = nil
+        functionKeyDownAt = nil
+        functionKeyUpAt = nil
         lock.unlock()
     }
 
@@ -65,7 +86,7 @@ final class ShortcutSessionObservation {
             timestamp = event.timestamp
             type = event.type.rawValue
             code = event.type.rawValue == 14
-                ? Int64(NSEvent(cgEvent: event)?.data1 ?? -1)
+                ? Int64(SystemKeyEventDecoder.data1(from: event) ?? -1)
                 : event.getIntegerValueField(.keyboardEventKeycode)
         }
     }
@@ -113,13 +134,14 @@ final class ShortcutSessionObservation {
     func observe(_ event: CGEvent, logger: (String) -> Void) {
         guard event.getIntegerValueField(.eventSourceUserData) == KeyboardInjector.syntheticEventMarker else { return }
         let now = uptime()
+        let key = EventKey(event)
         lock.lock()
-        let match = pending.removeValue(forKey: EventKey(event))
+        let match = pending.removeValue(forKey: key)
         lock.unlock()
         let actualFlags = ShortcutEventSequence.diagnosticFlags(event.flags)
         let eventKind: String
         if event.type.rawValue == 14 {
-            let state = ((NSEvent(cgEvent: event)?.data1 ?? 0) >> 8) & 0xFF
+            let state = (key.code >> 8) & 0xFF
             eventKind = state == 0xA ? "system_key_down" : "system_key_up"
         } else {
             eventKind = event.type == .keyDown ? "key_down" : "key_up"

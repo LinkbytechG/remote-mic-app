@@ -13,7 +13,7 @@ struct ButtonProfileFileOpeningTests {
     @Test(arguments: [false, true], ["buttonProfile", "personalBackup"])
     func consumesFinderRequestsBeforeAndAfterMounting(queuedBeforeMount: Bool, fileType: String) async throws {
         let suite = "RemoteMic.ButtonProfileFileOpening.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.completeOnboarding()
@@ -104,7 +104,7 @@ struct ButtonProfileFileOpeningTests {
     @MainActor
     @Test func retainsFinderRequestDuringOnboarding() async throws {
         let suite = "RemoteMic.ButtonProfileFileOpening.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         let model = BridgeAppModel(settings: settings)
@@ -116,7 +116,8 @@ struct ButtonProfileFileOpeningTests {
             buttonProfileImportRequests: requests,
             updateInformation: UpdateInformationStore(userDefaults: defaults),
             checkForUpdates: {}, refreshUpdateInformation: {},
-            setDockIconVisible: { _ in }, setStatusBarIconVisible: { _ in },
+            setDockIconVisible: { _ in },
+            setStatusBarIconVisible: { _ in },
             syncEntryPointVisibility: {}
         ).environmentObject(LocalizationStore(settings: settings))
             .onAppear { viewDidAppear = true })

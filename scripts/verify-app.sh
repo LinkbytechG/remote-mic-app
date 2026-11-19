@@ -3,6 +3,29 @@ set -euo pipefail
 
 ROOT="${0:A:h:h}"
 source "$ROOT/scripts/release-variant.sh"
+
+# ZERR covers errexit inside functions. EXIT also covers explicit validation
+# exits. Only public script coordinates enter the supervisor's status stream.
+TRAPZERR TRAPEXIT() {
+  local result=$?
+  if (( result != 0 && ZSH_SUBSHELL == 0 )) && [[ -n "${RELEASE_STAGE_STATUS_FILE:-}" ]]; then
+    python3 - "$RELEASE_STAGE_STATUS_FILE" "$RELEASE_VARIANT" \
+      "${funcfiletrace[1]##*:}" "$result" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+line, code = int(sys.argv[3]), int(sys.argv[4])
+if sys.argv[2] not in {"apple-silicon", "intel"} or line <= 0 or not 1 <= code <= 255:
+    sys.exit(1)
+record = {"schemaVersion": 1, "lane": sys.argv[2], "stage": "app-verify",
+          "checkLine": line, "exitCode": code}
+with open(sys.argv[1], "ab", buffering=0) as output:
+    output.write((json.dumps(record) + "\n").encode())
+PY
+  fi
+  return "$result"
+}
+
 if [[ "$#" -gt 1 ]]; then
   print -u2 "usage: $0 [APP]"
   exit 1
@@ -168,6 +191,12 @@ test -f "$APP/Contents/Resources/TROUBLESHOOTING.md"
 test -f "$APP/Contents/Resources/COPYRIGHT.md"
 test -f "$APP/Contents/Resources/LOGO-LICENSE.md"
 test -f "$APP/Contents/Resources/FirstInstallGuide.md"
+for onboarding_prompt_localization in en zh-Hans; do
+  onboarding_prompt="$APP/Contents/Resources/$onboarding_prompt_localization.lproj/OnboardingAIAssistantPrompt.txt"
+  test -f "$onboarding_prompt"
+  /usr/bin/grep -Fq -- '--agent-configure --auto --json' "$onboarding_prompt"
+done
+test -f "$APP/Contents/Resources/RC001-remote-photo.png"
 test -f "$APP/Contents/Resources/RC003-remote-photo.png"
 for onboarding_image in "$ROOT"/Resources/Onboarding/*.png(N); do
   test -f "$APP/Contents/Resources/Onboarding/${onboarding_image:t}"
@@ -608,7 +637,7 @@ if [[ "$RELEASE_VARIANT" == "intel" ]]; then
   done
 fi
 
-EXPECTED_APP_FILES=$'Contents/Helpers/SayAllMCP\nContents/Info.plist\nContents/MacOS/RemoteMic\nContents/Resources/AppIcon.icns\nContents/Resources/COPYRIGHT.md\nContents/Resources/FirstInstallGuide.md\nContents/Resources/LICENSE.md\nContents/Resources/LOGO-LICENSE.md\nContents/Resources/RC003-remote-photo.png\nContents/Resources/README.md\nContents/Resources/StatusIconActiveTemplate.png\nContents/Resources/StatusIconActiveTemplate@2x.png\nContents/Resources/StatusIconTemplate.png\nContents/Resources/StatusIconTemplate@2x.png\nContents/Resources/TECHNICAL.md\nContents/Resources/THIRD_PARTY_NOTICES.md\nContents/Resources/TROUBLESHOOTING.md\nContents/_CodeSignature/CodeResources'
+EXPECTED_APP_FILES=$'Contents/Helpers/SayAllMCP\nContents/Info.plist\nContents/MacOS/RemoteMic\nContents/Resources/AppIcon.icns\nContents/Resources/COPYRIGHT.md\nContents/Resources/FirstInstallGuide.md\nContents/Resources/LICENSE.md\nContents/Resources/LOGO-LICENSE.md\nContents/Resources/RC001-remote-photo.png\nContents/Resources/RC003-remote-photo.png\nContents/Resources/README.md\nContents/Resources/StatusIconActiveTemplate.png\nContents/Resources/StatusIconActiveTemplate@2x.png\nContents/Resources/StatusIconTemplate.png\nContents/Resources/StatusIconTemplate@2x.png\nContents/Resources/TECHNICAL.md\nContents/Resources/THIRD_PARTY_NOTICES.md\nContents/Resources/TROUBLESHOOTING.md\nContents/_CodeSignature/CodeResources'
 if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
   EXPECTED_APP_FILES=$'Contents/Frameworks/libopus.0.dylib\nContents/Helpers/SayAllAppleRemoteAudioCapture\nContents/Helpers/SayAllAppleRemoteHCIService\nContents/Library/LaunchServices/com.hd838a.SayAll.AppleRemoteHCIService\n'"$EXPECTED_APP_FILES"
 fi
@@ -641,8 +670,82 @@ done
 
 # Sentry's pinned SDK contains public CI __FILE__ paths, not local user paths.
 # Read the full pipeline so pipefail cannot hide a match through SIGPIPE.
-if rg -a -o --no-filename '/Users/[^[:space:]\x00]+|/tmp/remote-bridge|AA:BB:CC:DD:EE:FF' "$APP/Contents" \
-    | rg -v '^/Users/runner/work/sentry-cocoa/sentry-cocoa/Sources/([A-Za-z0-9_-]+/)+[A-Za-z0-9_+-]+\.(m|mm|c|cpp|h|swift)$' >/dev/null; then
+FORBIDDEN_CONTENT_PATTERN='/Users/[^[:space:]\x00]+|/tmp/remote-bridge|AA:BB:CC:DD:EE:FF'
+PUBLIC_SENTRY_PATH_PATTERN='^/Users/runner/work/sentry-cocoa/sentry-cocoa/Sources/([A-Za-z0-9_-]+/)+[A-Za-z0-9_+-]+\.(m|mm|c|cpp|h|swift)$'
+if rg -a -o --no-filename "$FORBIDDEN_CONTENT_PATTERN" "$APP/Contents" \
+    | rg -v "$PUBLIC_SENTRY_PATH_PATTERN" >/dev/null; then
+  # Fixed public component labels locate the rejection without reporting a
+  # matched value, filename, command output or private implementation detail.
+  for component in MacOS Helpers Frameworks Resources Library Info.plist _CodeSignature; do
+    if [[ -e "$APP/Contents/$component" ]]; then
+      "$ROOT/scripts/run-release-stage.sh" "$RELEASE_VARIANT" \
+        "app-content-${component:l}" 3 -- /bin/zsh -c '
+          set -euo pipefail
+          if matches="$(rg -a -o --no-filename "$1" "$3" | rg -v "$2")"; then
+            case "$matches" in
+              /Users/runner/work/sentry-cocoa/*) exit 11 ;;
+              /Users/runner/work/remote-mic-app/*) exit 12 ;;
+              /Users/runner/work/_temp/*) exit 13 ;;
+              /Users/*) exit 14 ;;
+              /tmp/remote-bridge*) exit 15 ;;
+              AA:BB:CC:DD:EE:FF*) exit 16 ;;
+              *) exit 17 ;;
+            esac
+          fi
+        ' -- "$FORBIDDEN_CONTENT_PATTERN" "$PUBLIC_SENTRY_PATH_PATTERN" \
+        "$APP/Contents/$component" || true
+      # Only fixed Mach-O location labels leave this diagnostic. Matched bytes,
+      # filenames and section names remain inside the protected process.
+      for content_location in $(python3 - "$APP/Contents/$component" <<'PY'
+from pathlib import Path
+import re
+import struct
+import sys
+
+pattern = re.compile(rb"/Users/[^\s\x00]+|/tmp/remote-bridge|AA:BB:CC:DD:EE:FF")
+public = re.compile(rb"/Users/runner/work/sentry-cocoa/sentry-cocoa/Sources/([A-Za-z0-9_-]+/)+[A-Za-z0-9_+-]+\.(m|mm|c|cpp|h|swift)")
+root = Path(sys.argv[1])
+locations = set()
+for path in ([root] if root.is_file() else root.rglob("*")):
+    if not path.is_file() or path.is_symlink():
+        continue
+    data = path.read_bytes()
+    matches = [m for m in pattern.finditer(data) if not public.fullmatch(m.group())]
+    if not matches:
+        continue
+    ranges = []
+    if data[:4] == b"\xcf\xfa\xed\xfe":
+        offset = 32
+        for _ in range(struct.unpack_from("<I", data, 16)[0]):
+            command, size = struct.unpack_from("<II", data, offset)
+            if command in (0x8000001C, 0xC):
+                ranges.append((offset, offset + size, "rpath" if command == 0x8000001C else "dylib"))
+            elif command == 0x2:
+                start, length = struct.unpack_from("<II", data, offset + 16)
+                ranges.append((start, start + length, "symbols"))
+            elif command == 0x1D:
+                start, length = struct.unpack_from("<II", data, offset + 8)
+                ranges.append((start, start + length, "signature"))
+            elif command == 0x19:
+                for index in range(struct.unpack_from("<I", data, offset + 64)[0]):
+                    section = offset + 72 + index * 80
+                    name = data[section:section + 16].split(b"\0")[0]
+                    length, start = struct.unpack_from("<QI", data, section + 40)
+                    label = {b"__cstring": "strings", b"__const": "constants",
+                             b"__swift5_reflstr": "reflection"}.get(name, "section")
+                    ranges.append((start, start + length, label))
+            offset += size
+    for match in matches:
+        locations.add(next((label for start, end, label in ranges
+                            if start <= match.start() < end), "other"))
+print("\n".join(sorted(locations)))
+PY
+      ); do
+        "$ROOT/scripts/run-release-stage.sh" "$RELEASE_VARIANT" \
+          "app-content-${component:l}-$content_location" 3 -- /usr/bin/false || true
+      done
+    fi
+  done
   print -u2 "bundle contains a forbidden local path or example device address"
   exit 1
 fi

@@ -134,6 +134,7 @@ enum FirstUseFailureReason: String, Codable, Equatable {
     case audioSelectedDeviceMissing = "audio.selected_device_missing"
     case audioOutputNotReady = "audio.output_not_ready"
     case voiceSessionNotStarted = "voice.session_not_started"
+    case voiceComponentMissing = "voice.component_missing"
     case voiceAuthorizationRequired = "voice.authorization_required"
     case voiceNoSamples = "voice.no_samples"
     case voiceSessionNotEnded = "voice.session_not_ended"
@@ -157,6 +158,7 @@ enum FirstUseFailureReason: String, Codable, Equatable {
         case .audioNoOutputDevice, .audioSelectedDeviceMissing, .audioOutputNotReady:
             return .audio
         case .voiceSessionNotStarted,
+             .voiceComponentMissing,
              .voiceAuthorizationRequired,
              .voiceNoSamples,
              .voiceSessionNotEnded,
@@ -347,30 +349,47 @@ struct FirstUseDiagnosticContext: Equatable {
     let step: OnboardingStep
     let remoteAvailability: OnboardingRemoteAvailability
     let controlMethod: OnboardingControlMethod
+    /// 生产路径与 `FirstUseDiagnosticSnapshot.controlSource` 取自同一个 Onboarding 设置。
+    /// 音频门禁按来源区分（Siri Remote 按需建立输出），所以失败原因必须看它。
+    let controlSource: OnboardingControlSource
     let capabilities: OnboardingCapabilities
     let hasSelectedAudioUID: Bool
     let voiceAttempt: FirstUseVoiceAttemptDiagnostic?
     let remoteInput: FirstUseRemoteInputDiagnostic
+    let voiceComponentMissing: Bool
     let voiceAuthorizationRequired: Bool
 
     init(
         step: OnboardingStep,
         remoteAvailability: OnboardingRemoteAvailability = .hasRemote,
         controlMethod: OnboardingControlMethod = .physicalRemote,
+        controlSource: OnboardingControlSource = .unselected,
         capabilities: OnboardingCapabilities,
         hasSelectedAudioUID: Bool,
         voiceAttempt: FirstUseVoiceAttemptDiagnostic? = nil,
         remoteInput: FirstUseRemoteInputDiagnostic = FirstUseRemoteInputDiagnostic(),
+        voiceComponentMissing: Bool = false,
         voiceAuthorizationRequired: Bool = false
     ) {
         self.step = step
         self.remoteAvailability = remoteAvailability
         self.controlMethod = controlMethod
+        self.controlSource = controlSource
         self.capabilities = capabilities
         self.hasSelectedAudioUID = hasSelectedAudioUID
         self.voiceAttempt = voiceAttempt
         self.remoteInput = remoteInput
+        self.voiceComponentMissing = voiceComponentMissing
         self.voiceAuthorizationRequired = voiceAuthorizationRequired
+    }
+
+    /// 音频页与完成页实际采用的门禁：`on_demand` 表示输出会在按下语音键时建立，
+    /// `ready_required` 表示要求输出在页面停留期间一直就绪。
+    var audioGate: String {
+        OnboardingAudioReadinessPolicy.usesOnDemandAudioOutput(
+            controlMethod: controlMethod,
+            controlSource: controlSource
+        ) ? "on_demand" : "ready_required"
     }
 
     var failureReason: FirstUseFailureReason? {
@@ -394,10 +413,16 @@ struct FirstUseDiagnosticContext: Equatable {
         case .audio:
             if !hasSelectedAudioUID { return .audioNoOutputDevice }
             if !capabilities.audioOutputSelected { return .audioSelectedDeviceMissing }
-            if !controlMethod.usesOnDemandAudioOutput && !capabilities.audioReady {
+            if !OnboardingAudioReadinessPolicy.isSatisfied(
+                controlMethod: controlMethod,
+                controlSource: controlSource,
+                audioOutputSelected: capabilities.audioOutputSelected,
+                audioReady: capabilities.audioReady
+            ) {
                 return .audioOutputNotReady
             }
         case .voiceTest:
+            if voiceComponentMissing { return .voiceComponentMissing }
             if voiceAuthorizationRequired { return .voiceAuthorizationRequired }
             if let voiceAttempt {
                 return voiceAttempt.failureReason
@@ -415,6 +440,7 @@ struct FirstUseDiagnosticContext: Equatable {
                 voiceTool: .other,
                 remoteAvailability: remoteAvailability,
                 controlMethod: controlMethod,
+                controlSource: controlSource,
                 capabilities: capabilities
             ) else { return .completeRuntimeRegressed }
         }
@@ -461,7 +487,44 @@ struct FirstUseEvent: Codable, Equatable {
     }
 }
 
+/// Snapshot included in redacted diagnostics so a user never has to inspect
+/// system paths by hand. It intentionally contains only booleans.
+struct SiriRemoteComponentDiagnosticState: Equatable {
+    let buildSupported: Bool
+    let installerReceiptPresent: Bool
+    let helperPresent: Bool
+    let launchDaemonPresent: Bool
+
+    var isInstalled: Bool {
+        helperPresent && launchDaemonPresent
+    }
+
+    var logFields: String {
+        "build_supported=\(buildSupported) " +
+            "installer_receipt_present=\(installerReceiptPresent) " +
+            "helper_present=\(helperPresent) " +
+            "launch_daemon_present=\(launchDaemonPresent) " +
+            "component_installed=\(isInstalled)"
+    }
+}
+
 struct FirstUseDiagnosticSnapshot {
+    static func buildIdentityFields(_ metadata: [String: Any]) -> String {
+        let revision = metadata["SayAllSourceCommit"] as? String ?? ""
+        let sourceRevision = revision.range(of: "\\A[0-9a-f]{40}\\z", options: .regularExpression) != nil
+            ? revision : "unknown"
+        let version = metadata["SayAllPrivatePlatformVersion"] as? String ?? ""
+        let privateVersion = version.count <= 32 &&
+            version.range(of: "\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z", options: .regularExpression) != nil
+            ? version : "unknown"
+        let channel = metadata["SayAllBuildChannel"] as? String ?? ""
+        let buildChannel = ["local", "release", "internalQA", "public", "private", "beta"].contains(channel)
+            ? channel : "unknown"
+        let sourceDirty = (metadata["SayAllSourceDirty"] as? Bool).map(String.init) ?? "unknown"
+        return "source_revision=\(sourceRevision) build_channel=\(buildChannel) " +
+            "source_dirty=\(sourceDirty) private_platform_version=\(privateVersion)"
+    }
+
     let appVersion: String
     let appBuild: String
     let systemMajorVersion: Int
@@ -477,6 +540,12 @@ struct FirstUseDiagnosticSnapshot {
     let events: [FirstUseEvent]
     let appLanguage: String
     var controlSource: OnboardingControlSource = .unselected
+    var siriRemoteComponent = SiriRemoteComponentDiagnosticState(
+        buildSupported: false,
+        installerReceiptPresent: false,
+        helperPresent: false,
+        launchDaemonPresent: false
+    )
     var voiceBinding: VoiceToolUserBinding? = nil
     let generatedAt = Date()
 
@@ -504,8 +573,8 @@ struct FirstUseDiagnosticSnapshot {
             "generated_at=\(Self.timestamp(generatedAt))",
             "app_version=\(appVersion)",
             "app_build=\(appBuild)",
-            "source_revision=unknown",
-            "build_channel=unknown",
+            Self.buildIdentityFields(Bundle.main.infoDictionary ?? [:])
+                .replacingOccurrences(of: " ", with: "\n"),
             "release_tag=unknown",
             "bundle_id=\(Bundle.main.bundleIdentifier ?? "unknown")",
             "process_id=\(ProcessInfo.processInfo.processIdentifier)",
@@ -524,6 +593,11 @@ struct FirstUseDiagnosticSnapshot {
             "onboarding_voice_key_policy=\(onboardingVoiceKeyPolicy)",
             "voice_key_policy_compliant=\(voiceKeyPolicyCompliant)",
             "control_source=\(controlSource.rawValue)",
+            "siri_remote_build_supported=\(siriRemoteComponent.buildSupported)",
+            "siri_remote_installer_receipt_present=\(siriRemoteComponent.installerReceiptPresent)",
+            "siri_remote_helper_present=\(siriRemoteComponent.helperPresent)",
+            "siri_remote_launch_daemon_present=\(siriRemoteComponent.launchDaemonPresent)",
+            "siri_remote_component_installed=\(siriRemoteComponent.isInstalled)",
             "voice_gesture=\(voiceBinding?.gestureMode.rawValue ?? "unresolved")",
             "voice_binding_source=\(voiceBinding?.source.rawValue ?? "unresolved")",
             "voice_binding_validation=\(voiceBinding?.validationState.rawValue ?? "unresolved")",
@@ -542,6 +616,7 @@ struct FirstUseDiagnosticSnapshot {
             "audio_device_selected=\(context.hasSelectedAudioUID)",
             "audio_device_available=\(capabilities.audioOutputSelected)",
             "audio_output_ready=\(capabilities.audioReady)",
+            "audio_gate=\(context.audioGate)",
             "voice_started=\(capabilities.voiceSessionStarted)",
             "voice_samples_received=\(capabilities.voiceSamplesReceived)",
             "voice_ended=\(capabilities.voiceSessionEnded)",

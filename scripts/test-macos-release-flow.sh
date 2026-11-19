@@ -334,6 +334,153 @@ print "CONSOLIDATED CI PROOF AND REJECTION FIXTURE PASS"
 
 )
 
+test_metadata_ready_ci() (
+ROOT="$SCRIPT_ROOT"
+export RELEASE_CONTROL_PLANE_DIFF_BIN="$ROOT/scripts/verify-release-control-plane-diff.sh"
+WORK_DIR="$(/usr/bin/mktemp -d /private/tmp/sayall-release-metadata-gate-test.XXXXXX)"
+cleanup() {
+  local trash_root="$HOME/.Trash"
+  local trash_target="$trash_root/sayall-release-metadata-gate-test.$(/bin/date +%s).$.$RANDOM"
+  /bin/mkdir -p "$trash_root"
+  [[ -d "$WORK_DIR" ]] && /bin/mv "$WORK_DIR" "$trash_target"
+}
+trap cleanup EXIT
+
+source_remote="$WORK_DIR/source-remote.git"
+source_repo="$WORK_DIR/source-repo"
+fixture_root="$WORK_DIR/gh-fixtures"
+/usr/bin/git init -q --bare "$source_remote"
+/usr/bin/git init -q "$source_repo"
+/usr/bin/git -C "$source_repo" config user.name "Release Metadata Gate Fixture"
+/usr/bin/git -C "$source_repo" config user.email "release-metadata-gate-fixture@example.invalid"
+/bin/mkdir -p "$source_repo/Sources" "$source_repo/Resources/zh-Hans.lproj" "$source_repo/Resources/en.lproj" "$fixture_root"
+print -r -- 'product baseline' > "$source_repo/Sources/Product.swift"
+cat > "$source_repo/Resources/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.example.metadata-gate</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+</dict>
+</plist>
+PLIST
+print -r -- '## 1.0.0（预发布）' > "$source_repo/Resources/zh-Hans.lproj/ReleaseHistory.md"
+print -r -- '## 1.0.0 (Pre-release)' > "$source_repo/Resources/en.lproj/ReleaseHistory.md"
+/usr/bin/git -C "$source_repo" add .
+/usr/bin/git -C "$source_repo" commit -q -m 'full product baseline'
+/usr/bin/git -C "$source_repo" branch -M main
+/usr/bin/git -C "$source_repo" remote add origin "$source_remote"
+/usr/bin/git -C "$source_repo" push -q origin main
+product_commit="$(/usr/bin/git -C "$source_repo" rev-parse HEAD)"
+
+python3 - "$source_repo/Resources/Info.plist" <<'PY'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+data = path.read_text()
+for key, value in (("CFBundleShortVersionString", "1.0.1"), ("CFBundleVersion", "2")):
+    data = re.sub(
+        rf"(<key>{key}</key>\s*<string>)[^<]*(</string>)",
+        lambda match: match.group(1) + value + match.group(2),
+        data,
+        count=1,
+    )
+path.write_text(data)
+PY
+python3 - "$source_repo/Resources/zh-Hans.lproj/ReleaseHistory.md" '## 1.0.1（预发布）' <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(sys.argv[2] + "\n\n- fixture\n\n" + path.read_text())
+PY
+python3 - "$source_repo/Resources/en.lproj/ReleaseHistory.md" '## 1.0.1 (Pre-release)' <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(sys.argv[2] + "\n\n- fixture\n\n" + path.read_text())
+PY
+/usr/bin/git -C "$source_repo" add .
+/usr/bin/git -C "$source_repo" commit -q -m 'release metadata change'
+/usr/bin/git -C "$source_repo" push -q origin main
+metadata_commit="$(/usr/bin/git -C "$source_repo" rev-parse HEAD)"
+
+cat > "$WORK_DIR/fake-gh" <<'GH'
+#!/bin/zsh
+set -euo pipefail
+fixture_root="${FIXTURE_ROOT:?}"
+if [[ "$1" == run && "$2" == list ]]; then
+  commit=""
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "--commit" ]]; then commit="$argument"; fi
+    previous="$argument"
+  done
+  [[ -r "$fixture_root/commit-$commit.id" ]] || exit 1
+  /bin/cat "$fixture_root/commit-$commit.id"
+  exit 0
+fi
+if [[ "$1" == run && "$2" == view ]]; then
+  cat "$fixture_root/run-$3.json"
+  exit 0
+fi
+exit 1
+GH
+/bin/chmod 755 "$WORK_DIR/fake-gh"
+
+write_metadata_run() {
+  local run_id="$1" commit="$2" mode="$3"
+  jq -n --arg sha "$commit" --arg url "https://github.example.invalid/runs/$run_id" --arg mode "$mode" '
+    {
+      workflowName: "macOS CI", event: "push", status: "completed", conclusion: "success",
+      headBranch: "main", headSha: $sha, url: $url, updatedAt: "2026-09-27T00:00:00Z",
+      jobs: [
+        {name: "Swift tests and build (Apple Silicon)", status: "completed", conclusion: "success",
+         steps: (if $mode == "full" then [
+           {name: "Run Swift tests", conclusion: "success"},
+           {name: "Run project self-test", conclusion: "success"},
+           {name: "Build release configuration", conclusion: "success"}
+         ] else [{name: "Run release metadata checks", conclusion: "success"}] end)},
+        {name: "Swift tests and build (Intel Ventura)", status: "completed", conclusion: "success",
+         steps: (if $mode == "full" then [
+           {name: "Run Swift tests", conclusion: "success"},
+           {name: "Run project self-test", conclusion: "success"},
+           {name: "Build release configuration", conclusion: "success"}
+         ] else [{name: "Run release metadata checks", conclusion: "success"}] end)}
+      ]
+    }' > "$fixture_root/run-$run_id.json"
+}
+write_metadata_run 220 "$product_commit" full
+write_metadata_run 221 "$metadata_commit" metadata
+print -r -- 220 > "$fixture_root/commit-$product_commit.id"
+print -r -- 221 > "$fixture_root/commit-$metadata_commit.id"
+REPOSITORY_ROOT="$source_repo" GH_BIN="$WORK_DIR/fake-gh" FIXTURE_ROOT="$fixture_root" \
+  RELEASE_READY_PROOF_OUTPUT="$WORK_DIR/metadata-proof.json" \
+  "$ROOT/scripts/verify-release-ready-main-ci.sh" "$metadata_commit" main > "$WORK_DIR/metadata-pass.log"
+jq -e --arg candidate "$metadata_commit" --arg product "$product_commit" \
+  '.candidateCommit == $candidate and .productProofCommit == $product' "$WORK_DIR/metadata-proof.json" >/dev/null
+
+print -r -- 'product change after metadata' > "$source_repo/Sources/Product.swift"
+/usr/bin/git -C "$source_repo" add .
+/usr/bin/git -C "$source_repo" commit -q -m 'product change with metadata CI'
+/usr/bin/git -C "$source_repo" push -q origin main
+mixed_commit="$(/usr/bin/git -C "$source_repo" rev-parse HEAD)"
+write_metadata_run 222 "$mixed_commit" metadata
+print -r -- 222 > "$fixture_root/commit-$mixed_commit.id"
+if REPOSITORY_ROOT="$source_repo" GH_BIN="$WORK_DIR/fake-gh" FIXTURE_ROOT="$fixture_root" \
+    "$ROOT/scripts/verify-release-ready-main-ci.sh" "$mixed_commit" main > "$WORK_DIR/metadata-rejected.log" 2>&1; then
+  print -u2 "release metadata gate accepted a product change"
+  exit 1
+fi
+/usr/bin/grep -Fq 'source changes after the inherited product proof are not release-metadata-only' "$WORK_DIR/metadata-rejected.log"
+print "RELEASE METADATA READY CI FIXTURE PASS"
+)
+
 test_metadata() (
 ROOT="$SCRIPT_ROOT"
 WORK_DIR="$(/usr/bin/mktemp -d /private/tmp/sayall-prepare-preview-release-test.XXXXXX)"
@@ -357,6 +504,9 @@ trap cleanup EXIT
 /bin/cp "$ROOT/scripts/verify-preview-cdn-availability.sh" "$CHECKOUT/scripts/verify-preview-cdn-availability.sh"
 /bin/chmod 755 "$CHECKOUT/scripts/prepare-preview-release.sh"
 /bin/chmod 755 "$CHECKOUT/scripts/verify-preview-cdn-availability.sh"
+/bin/mkdir -p "$CHECKOUT/config"
+/bin/cp "$ROOT/config/release-assets.json" "$CHECKOUT/config/"
+/bin/cp "$ROOT/scripts/release-assets.py" "$CHECKOUT/scripts/"
 print -r -- '<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>CFBundleShortVersionString</key><string>1.9.10</string>
@@ -382,6 +532,11 @@ print -r -- '# History
 
 print -r -- '#!/bin/zsh
 set -euo pipefail
+if [[ "$1" == release && "$2" == list ]]; then
+  print -r -- "[{\"tagName\":\"v2.0.0-local.271\"},{\"tagName\":\"v2.0.5-local.393\"},{\"tagName\":\"v2.0.6-local.394\"},{\"tagName\":\"remote-mic-1.8.5-intel-ventura-test-build66-20260812\"}]" \
+    | /usr/bin/jq -r "${@[-1]}"
+  exit 0
+fi
 if [[ "$1" == api && "$2" == --include ]]; then
   print -r -- "HTTP/2.0 404 Not Found"
   exit 1
@@ -394,7 +549,12 @@ FAKE_BIN="$WORK_DIR/bin"
 /bin/mkdir -p "$FAKE_BIN"
 print -r -- '#!/bin/zsh
 set -euo pipefail
-print -rn -- 404' > "$FAKE_BIN/curl"
+if [[ "$*" == *release-contract.json* ]]; then
+  /bin/cp "$CDN_CONTRACT_FIXTURE" "${@[-1]}"
+else
+  print -rn -- 404
+fi' > "$FAKE_BIN/curl"
+export CDN_CONTRACT_FIXTURE="$ROOT/config/release-assets.json"
 /bin/chmod 755 "$FAKE_BIN/curl"
 
 zh_notes="$WORK_DIR/zh.md"
@@ -407,9 +567,9 @@ PATH="$FAKE_BIN:$PATH" REPOSITORY_ROOT="$BRANCH" GH_BIN="$FAKE_GH" \
   > "$WORK_DIR/result.txt"
 
 /usr/bin/grep -Fq 'SELECTED_VERSION: 1.9.11' "$WORK_DIR/result.txt"
-/usr/bin/grep -Fq 'SELECTED_BUILD: 140' "$WORK_DIR/result.txt"
+/usr/bin/grep -Fq 'SELECTED_BUILD: 404' "$WORK_DIR/result.txt"
 test "$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$BRANCH/Resources/Info.plist")" = 1.9.11
-test "$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$BRANCH/Resources/Info.plist")" = 140
+test "$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$BRANCH/Resources/Info.plist")" = 404
 test "$(/usr/bin/git -C "$BRANCH" diff --name-only | LC_ALL=C /usr/bin/sort)" = \
   $'Resources/Info.plist\nResources/en.lproj/ReleaseHistory.md\nResources/zh-Hans.lproj/ReleaseHistory.md'
 /usr/bin/grep -Fq '## 1.9.11（预发布）' "$BRANCH/Resources/zh-Hans.lproj/ReleaseHistory.md"
@@ -421,6 +581,10 @@ ERROR_GH="$WORK_DIR/error-gh"
 /usr/bin/git -C "$ERROR_BRANCH" checkout -q -b codex/release-metadata-error origin/main
 print -r -- '#!/bin/zsh
 set -euo pipefail
+if [[ "$1" == release && "$2" == list ]]; then
+  print -rn -- 394
+  exit 0
+fi
 if [[ "$1" == api && "$2" == --include ]]; then
   print -r -- "HTTP/2.0 500 Internal Server Error"
   exit 1
@@ -435,6 +599,24 @@ if PATH="$FAKE_BIN:$PATH" REPOSITORY_ROOT="$ERROR_BRANCH" GH_BIN="$ERROR_GH" \
 fi
 /usr/bin/grep -Fq 'unable to check GitHub Release v1.9.11 (HTTP 500' "$WORK_DIR/error-stderr.txt"
 test "$(/usr/bin/git -C "$ERROR_BRANCH" status --porcelain)" = ""
+
+REMOTE_ERROR_BRANCH="$WORK_DIR/remote-error-branch"
+REMOTE_ERROR_GH="$WORK_DIR/remote-error-gh"
+/usr/bin/git clone -q "$ORIGIN" "$REMOTE_ERROR_BRANCH"
+/usr/bin/git -C "$REMOTE_ERROR_BRANCH" checkout -q -b codex/release-metadata-remote-error origin/main
+print -r -- '#!/bin/zsh
+set -euo pipefail
+exit 1' > "$REMOTE_ERROR_GH"
+/bin/chmod 755 "$REMOTE_ERROR_GH"
+if PATH="$FAKE_BIN:$PATH" REPOSITORY_ROOT="$REMOTE_ERROR_BRANCH" GH_BIN="$REMOTE_ERROR_GH" \
+  "$REMOTE_ERROR_BRANCH/scripts/prepare-preview-release.sh" 1.9.11 141 "$zh_notes" "$en_notes" \
+  > "$WORK_DIR/remote-error-result.txt" 2> "$WORK_DIR/remote-error-stderr.txt"; then
+  print -u2 "prepare-preview-release guessed a Build number without readable private Draft tags"
+  exit 1
+fi
+/usr/bin/grep -Fq 'unable to read remote private Draft build tags from GetSayAll/SayAll' \
+  "$WORK_DIR/remote-error-stderr.txt"
+test "$(/usr/bin/git -C "$REMOTE_ERROR_BRANCH" status --porcelain)" = ""
 
 print "PREVIEW RELEASE PREPARATION FIXTURE PASS"
 
@@ -459,6 +641,7 @@ for script in \
   verify-preview-cdn-availability.sh \
   verify-staged-release-assets.sh recover-preview-stage.sh publish-staged-preview.sh \
   publish-preview-release.sh promote-preview-release.sh prepare-staged-preview-ui-test.sh \
+  verify-release-metadata.sh verify-preview-ui-assets.sh \
   record-preview-ui-attestation.sh; do
   [[ -x "$ROOT/scripts/$script" ]] || {
     print -u2 "release helper is not executable: $script"
@@ -472,6 +655,7 @@ for script in \
   verify-preview-cdn-availability.sh \
   recover-preview-stage.sh publish-staged-preview.sh publish-preview-release.sh \
   promote-preview-release.sh prepare-staged-preview-ui-test.sh \
+  verify-release-metadata.sh verify-preview-ui-assets.sh \
   record-preview-ui-attestation.sh; do
   case "$script" in
     prepare-public-release-assets.sh|stage-macos-preview.sh|prepare-preview-release.sh)
@@ -482,16 +666,35 @@ for script in \
 done
 
 test_ready_ci
+test_metadata_ready_ci
 python3 "$ROOT/scripts/test-private-platform.py"
 
 package_workflow="$ROOT/.github/workflows/mac-release-package.yml"
 publication_workflow="$ROOT/.github/workflows/mac-preview-publication.yml"
 stable_workflow="$ROOT/.github/workflows/mac-stable-promote.yml"
 ci_workflow="$ROOT/.github/workflows/mac-ci.yml"
+python3 - "$ci_workflow" <<'PYTHON'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+assert source.index("- name: Run release control-plane fixture") < source.index("- name: Run Swift tests")
+assert source.count("./scripts/test-macos-release-flow.sh") == 1
+assert source.count("--skip releaseControlPlaneFixtureHasExecutableRegressionCoverage") == 2
+assert "Run release metadata checks" in source
+assert "release_metadata_only" in source
+PYTHON
+
 private_ci_workflow="$ROOT/.github/workflows/mac-private-ci.yml"
 notarize_release="$ROOT/scripts/notarize-release.sh"
 opus_build="$ROOT/scripts/build-apple-remote-opus.sh"
 
+/usr/bin/grep -Fq 'RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS="${RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS:-600}"' \
+  "$notarize_release"
+
+/usr/bin/grep -Fq -- 'verify-release-asset-source.sh' "$ROOT/scripts/package-macos-release-in-actions.sh" || {
+  print -u2 "CI packaging must read the source commit back from every artifact"
+  exit 1
+}
 /usr/bin/grep -Fq -- '--disable-keychain' "$ROOT/scripts/build-app.sh"
 /usr/bin/grep -Fq 'xcrun swift build --disable-keychain' "$ROOT/scripts/test.sh"
 if [[ "$(/usr/bin/grep -c -- '--disable-keychain' "$ROOT/scripts/build-app.sh")" -lt 2 ]]; then
@@ -502,45 +705,40 @@ fi
 /usr/bin/grep -Fq 'mode:' "$package_workflow"
 /usr/bin/grep -Fq 'expected_commit:' "$package_workflow"
 /usr/bin/grep -Fq 'source_branch:' "$package_workflow"
-/usr/bin/grep -Fq 'if: ${{ inputs.include_ai }}' "$package_workflow"
 /usr/bin/grep -Fq 'INCLUDE_SAYALL_AI: ${{ inputs.include_ai && '\''1'\'' || '\''0'\'' }}' "$package_workflow"
 /usr/bin/grep -Fq 'INCLUDE_SAYALL_AI="${INCLUDE_SAYALL_AI:-0}"' "$ROOT/scripts/stage-macos-preview.sh"
 /usr/bin/grep -Fq -- 'include_ai=$include_ai' "$ROOT/scripts/stage-macos-preview.sh"
-/usr/bin/grep -Fq 'Build and prepare private feature artifacts' "$package_workflow"
-/usr/bin/grep -Fq 'build-private-xcframeworks.sh' "$package_workflow"
+/usr/bin/grep -Fq 'Verify and prepare published private artifacts' "$package_workflow"
 /usr/bin/grep -Fq 'prepare-private-artifact-package.sh' "$package_workflow"
 /usr/bin/grep -Fq 'SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH=$PRIVATE_ARTIFACT_PACKAGE' "$package_workflow"
-/usr/bin/grep -Fq 'REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE=1' "$package_workflow"
-/usr/bin/grep -Fq 'REQUIRE_SAYALL_BUTTON_PROFILES=1' "$package_workflow"
+for requirement in REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE REQUIRE_SAYALL_BUTTON_PROFILES \
+  REQUIRE_SAYALL_COMBINATION_ACTIONS REQUIRE_SAYALL_CHROMECAST REQUIRE_SAYALL_MAC_REMOTE_PACKAGE; do
+  /usr/bin/grep -Fq "$requirement=1" "$package_workflow"
+done
 /usr/bin/grep -Fq 'SAYALL_BUILD_CHANNEL=release' "$package_workflow"
-/usr/bin/grep -Fq 'SAYALL_CHROMECAST_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform/packages/audio-input-kit/chromecast' "$package_workflow"
-/usr/bin/grep -Fq 'REQUIRE_SAYALL_CHROMECAST=1' "$package_workflow"
-/usr/bin/grep -Fq 'SAYALL_COMBINATION_ACTIONS_PATH=' "$package_workflow" && {
-  print -u2 "protected release must use the verified private artifact package for combination actions"
+if /usr/bin/grep -Eq 'build-private-xcframeworks|[.]private-dependencies/sayall-private-platform|[.]private-dependencies/sayall-ai' "$package_workflow"; then
+  print -u2 "public staging must exclude private source checkouts and compiler fallbacks"
   exit 1
-}
-# Execute the actual workflow configuration body without checkout or credentials.
+fi
 ai_input="$(/usr/bin/awk '/^      include_ai:/ { capture=1; next } capture && /^concurrency:/ { exit } capture { print }' "$package_workflow")"
 print -r -- "$ai_input" | /usr/bin/grep -Fq 'default: false'
 print -r -- "$ai_input" | /usr/bin/grep -Fq 'type: boolean'
-configure_features="$(/usr/bin/awk '
-  /- name: Configure private feature package/ { found=1; next }
+if INCLUDE_SAYALL_AI=1 "$ROOT/scripts/stage-macos-preview.sh" preview > "$WORK_DIR/ai-rejected.log" 2>&1; then
+  print -u2 "source-only AI distribution must stop before dispatch"
+  exit 1
+fi
+/usr/bin/grep -Fq 'published binary artifact contract' "$WORK_DIR/ai-rejected.log"
+prepare_features="$(/usr/bin/awk '
+  /- name: Verify and prepare published private artifacts/ { found=1; next }
   found && /run: \|/ { capture=1; next }
   capture && /^      - name:/ { exit }
   capture { print }
 ' "$package_workflow")"
-for ai_mode in 0 1; do
-  ai_env="$WORK_DIR/ai-config-$ai_mode.env"
-  INCLUDE_SAYALL_AI="$ai_mode" GITHUB_WORKSPACE="$WORK_DIR" GITHUB_ENV="$ai_env" \
-    /bin/bash -e -c "$configure_features"
-  /usr/bin/grep -Fxq "SAYALL_MAC_REMOTE_PACKAGE_PATH=$WORK_DIR/.private-dependencies/sayall-private-platform/packages/macos-remote" "$ai_env"
-  /usr/bin/grep -Fxq "REQUIRE_SAYALL_AI_PACKAGE=$ai_mode" "$ai_env"
-  if [[ "$ai_mode" == 0 ]]; then
-    /usr/bin/grep -Fxq 'SAYALL_AI_PACKAGE_PATH=' "$ai_env"
-  else
-    /usr/bin/grep -Fxq "SAYALL_AI_PACKAGE_PATH=$WORK_DIR/.private-dependencies/sayall-ai" "$ai_env"
-  fi
-done
+if GH_TOKEN= /bin/bash -e -c "$prepare_features" > "$WORK_DIR/missing-private-read.log" 2>&1; then
+  print -u2 "missing private attachment access must stop before preparing artifacts"
+  exit 1
+fi
+/usr/bin/grep -Fq 'Private release attachment access is required' "$WORK_DIR/missing-private-read.log"
 ai_requirement="$(/usr/bin/grep '^export REQUIRE_SAYALL_AI_PACKAGE=' "$notarize_release")"
 [[ "$(env -u REQUIRE_SAYALL_AI_PACKAGE /bin/zsh -c "$ai_requirement; print -- \$REQUIRE_SAYALL_AI_PACKAGE")" == 0 ]]
 [[ "$(REQUIRE_SAYALL_AI_PACKAGE=1 /bin/zsh -c "$ai_requirement; print -- \$REQUIRE_SAYALL_AI_PACKAGE")" == 1 ]]
@@ -553,7 +751,7 @@ ai_requirement="$(/usr/bin/grep '^export REQUIRE_SAYALL_AI_PACKAGE=' "$notarize_
 /usr/bin/grep -Fq '/.private-release/' "$package_workflow"
 /usr/bin/grep -Fq 'test "$TRIGGER_REF_NAME" = main' "$package_workflow"
 /usr/bin/grep -Fq 'verify-public-release-source.sh' "$package_workflow"
-/usr/bin/grep -Fq 'RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS="${RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS:-420}"' "$notarize_release"
+/usr/bin/grep -Fq 'RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS="${RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS:-600}"' "$notarize_release"
 /usr/bin/grep -Fq 'RELEASE_APP_BUILD_TIMEOUT_SECONDS="${RELEASE_APP_BUILD_TIMEOUT_SECONDS:-450}"' "$notarize_release"
 /usr/bin/grep -Fq 'export RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS' "$notarize_release"
 for release_dependency in \
@@ -573,13 +771,7 @@ fi
 /usr/bin/grep -Fq "branches: [main, 'hotfix/**']" "$ci_workflow"
 /usr/bin/grep -Fq 'swift test --disable-keychain --filter BuildSigningTests' "$ci_workflow"
 /usr/bin/grep -Fq 'macOS private integration CI' "$private_ci_workflow"
-/usr/bin/grep -Fq 'SAYALL_PRIVATE_PLATFORM_DEPLOY_KEY' "$private_ci_workflow"
-/usr/bin/grep -Fq 'Resolve private platform version' "$private_ci_workflow"
-/usr/bin/grep -Fq 'Run private integration tests' "$private_ci_workflow"
-/usr/bin/grep -Fq 'configuration: [free-combination-actions, paid-button-profiles]' "$private_ci_workflow"
-/usr/bin/grep -Fq 'SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform' "$private_ci_workflow"
-/usr/bin/grep -Fq 'sayall_private_platform_version' "$private_ci_workflow"
-/usr/bin/grep -Fq 'SAYALL_PRIVATE_PLATFORM_DEPLOY_KEY' "$package_workflow"
+/usr/bin/grep -Fq 'SAYALL_PRIVATE_RELEASE_READ_TOKEN' "$package_workflow"
 /usr/bin/grep -Fq 'sayall_private_platform_version' "$ci_workflow" && {
   print -u2 "public macOS CI must not resolve private dependency outputs"
   exit 1
@@ -588,8 +780,6 @@ fi
 /usr/bin/grep -Fq 'SAYALL_PRIVATE_PLATFORM_VERSION' "$package_workflow"
 /usr/bin/grep -Fq 'update-private-dependency-versions.sh' "$ROOT/.github/workflows/update-private-dependency-versions.yml"
 /usr/bin/grep -Fq '[0-9]+\\.[0-9]+\\.[0-9]+' "$ROOT/scripts/verify-release-dependency-pins.sh"
-/usr/bin/grep -Fq 'test -f .private-dependencies/sayall-private-platform/packages/audio-input-kit/siri-remote/Package.swift' "$package_workflow"
-/usr/bin/grep -Fq 'SAYALL_SIRI_REMOTE_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform/packages/audio-input-kit/siri-remote' "$package_workflow"
 /usr/bin/grep -Fq 'RELEASE_VARIANT=apple-silicon ./scripts/build-apple-remote-opus.sh' "$package_workflow"
 /usr/bin/grep -Fq 'RELEASE_VARIANT=intel ./scripts/build-apple-remote-opus.sh' "$package_workflow"
 /usr/bin/grep -Fq 'CONFIGURE_HOST_ARGS=(--host "$CROSS_HOST")' "$opus_build"
@@ -608,12 +798,22 @@ fi
 /usr/bin/grep -Fq 'name: Public Swift tests and dual-architecture build' "$ci_workflow"
 /usr/bin/grep -Fq 'needs: [classify_changes, public_test]' "$ci_workflow"
 public_job="$(/usr/bin/awk '/^  public_test:/ { capture=1 } /^  test:/ { exit } capture { print }' "$ci_workflow")"
+macos_tool_setup="$(print -r -- "$public_job" | /usr/bin/awk '
+  /- name: Ensure macOS CI tools/ { capture=1 }
+  capture && /- name: Check patch formatting/ { exit }
+  capture { print }
+')"
+[[ -n "$macos_tool_setup" ]]
+print -r -- "$macos_tool_setup" | /usr/bin/grep -Fq \
+  "if: needs.classify_changes.outputs.product_change == 'true' || (needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true')"
+print -r -- "$macos_tool_setup" | /usr/bin/grep -Fq \
+  'command -v rg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep'
 for package_path in SAYALL_AI_PACKAGE_PATH SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH SAYALL_COMBINATION_ACTIONS_PATH SAYALL_BUTTON_PROFILES_PACKAGE_PATH SAYALL_MAC_REMOTE_PACKAGE_PATH; do
   print -r -- "$public_job" | /usr/bin/grep -Fq "$package_path: \"\""
 done
-if ! /usr/bin/grep -Fq 'configuration: [free-combination-actions, paid-button-profiles]' "$private_ci_workflow" || \
-   ! /usr/bin/grep -Fq "matrix.configuration == 'paid-button-profiles'" "$private_ci_workflow"; then
-  print -u2 "private CI must keep the paid feature matrix separate from public CI"
+/usr/bin/grep -Fq 'macos-host-integration.yml' "$private_ci_workflow"
+if /usr/bin/grep -Eq 'swift (test|build)|secrets[.]|SAYALL_ENABLE_PRIVATE_SWIFTPM' "$private_ci_workflow"; then
+  print -u2 "private source validation must execute in the private repository"
   exit 1
 fi
 if [[ "$(/usr/bin/grep -c -- 'swift test --disable-keychain' "$ci_workflow")" -lt 4 ]] || \
@@ -650,7 +850,8 @@ fi
 /usr/bin/grep -Fq 'ref: ${{ github.sha }}' "$publication_workflow"
 /usr/bin/grep -Fq 'TRIGGER_REPOSITORY' "$publication_workflow"
 /usr/bin/grep -Fq "github.ref_name == 'main'" "$publication_workflow"
-if /usr/bin/grep -Eq 'environment:[[:space:]]*mac-release|secrets[.]|RELEASE_AGE_IDENTITY|MATCH|NOTARY|draft:' "$publication_workflow"; then
+if /usr/bin/grep -Eq 'environment:[[:space:]]*mac-release|RELEASE_AGE_IDENTITY|MATCH|NOTARY|draft:' "$publication_workflow" ||
+   /usr/bin/grep -oE 'secrets[.][A-Za-z0-9_]+' "$publication_workflow" | /usr/bin/grep -Fxv 'secrets.SAYALL_FEED_SYNC_TOKEN'; then
   print -u2 "Preview publication workflow contains protected Apple inputs"
   exit 1
 fi
@@ -703,6 +904,11 @@ ui_prep_source="$ROOT/scripts/prepare-staged-preview-ui-test.sh"
 /usr/bin/grep -Fq 'zipinfo -l' "$recovery_source"
 /usr/bin/grep -Fq 'zipinfo -l' "$ROOT/scripts/promote-preview-release.sh"
 /usr/bin/grep -Fq 'browser_download_url' "$ui_prep_source"
+/usr/bin/grep -Fq 'mac-preview-ui-payload-' "$ui_prep_source"
+/usr/bin/grep -Fq 'verify-preview-ui-assets.sh' "$recovery_source"
+/usr/bin/grep -Fq 'MODE="${7:-full}"' "$recovery_source"
+/usr/bin/grep -Fq 'Prepare immutable UI test payload' "$package_workflow"
+/usr/bin/grep -Fq 'mac-preview-ui-payload-v' "$package_workflow"
 if /usr/bin/grep -Fq 'application/octet-stream' "$ui_prep_source"; then
   print -u2 "Preview UI preparation still relies on an unsupported gh API media type"
   exit 1
@@ -875,6 +1081,14 @@ fake_bin="$WORK_DIR/bin"
 print -r -- '#!/bin/zsh
 set -euo pipefail
 mode="${CDN_FIXTURE_MODE:-404}"
+if [[ "$*" == *release-contract.json* ]]; then
+  case "$mode" in
+    unsupported) print -r -- "{}" > "${@[-1]}" ;;
+    unavailable) exit 22 ;;
+    *) /bin/cp "$CDN_CONTRACT_FIXTURE" "${@[-1]}" ;;
+  esac
+  exit 0
+fi
 is_head=false
 for arg in "$@"; do
   [[ "$arg" == --head ]] && is_head=true
@@ -889,6 +1103,7 @@ case "$mode" in
   *) print -rn -- 000; exit 1 ;;
 esac' > "$fake_bin/curl"
 /bin/chmod 755 "$fake_bin/curl"
+export CDN_CONTRACT_FIXTURE="$ROOT/config/release-assets.json"
 PATH="$fake_bin:$PATH" CDN_FIXTURE_MODE=404 \
   "$ROOT/scripts/verify-preview-cdn-availability.sh" v9.9.9 999 >/dev/null
 if PATH="$fake_bin:$PATH" CDN_FIXTURE_MODE=200 \
@@ -911,6 +1126,16 @@ else
   exit 1
 fi
 
+for mode in unsupported unavailable; do
+  if PATH="$fake_bin:$PATH" CDN_FIXTURE_MODE="$mode" \
+    "$ROOT/scripts/verify-preview-cdn-availability.sh" v9.9.9 999 > "$WORK_DIR/contract-$mode.log" 2>&1; then
+    print -u2 "CDN occupancy gate accepted an incompatible deployed contract"
+    exit 1
+  fi
+done
+PATH="$fake_bin:$PATH" CDN_FIXTURE_MODE=200 \
+  "$ROOT/scripts/verify-preview-cdn-availability.sh" v9.9.9 999 --contract-only >/dev/null
+
 # Build a deterministic canonical payload fixture and exercise the manifest gate.
 public_dir="$WORK_DIR/public"
 /bin/mkdir -p "$public_dir"
@@ -931,8 +1156,19 @@ for name in \
 done
 python3 - "$public_dir" <<'PYTHON'
 from pathlib import Path
+import subprocess
 import sys
+import zipfile
 public = Path(sys.argv[1])
+payload = public.parent / "installer-payload"
+payload.mkdir()
+(payload / "PublicFixture.txt").write_text("public fixture")
+for archive in public.glob("*.zip"):
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SayAll.app/Contents/MacOS/RemoteMic", b"public runtime fixture")
+for installer in public.glob("*.pkg"):
+    subprocess.run(["pkgbuild", "--root", str(payload), "--identifier", "invalid.example.release-fixture", "--version", "1", str(installer)],
+                   check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 for feed, suffix in [("appcast.xml", ""), ("appcast-intel.xml", "-Intel")]:
     archive = f"SayAll-9.9.9-999{suffix}.zip"
     length = (public / archive).stat().st_size
@@ -963,6 +1199,16 @@ write_fixture_manifest() {
 write_fixture_manifest
 
 "$ROOT/scripts/verify-staged-release-assets.sh" "$manifest" "$public_dir" >/dev/null
+"$ROOT/scripts/verify-preview-ui-assets.sh" "$manifest" "$public_dir" >/dev/null
+ui_archive="$public_dir/SayAll-9.9.9-999.zip"
+cp "$ui_archive" "$WORK_DIR/ui-archive.saved"
+print -rn -- altered >> "$ui_archive"
+if "$ROOT/scripts/verify-preview-ui-assets.sh" "$manifest" "$public_dir" >/dev/null 2>&1; then
+  print -u2 "UI asset verifier accepted an altered archive"
+  exit 1
+fi
+cp "$WORK_DIR/ui-archive.saved" "$ui_archive"
+print "PREVIEW UI ASSET FIXTURE PASS"
 # Update digests too, so each rejection proves URL/metadata validation.
 cp "$public_dir/appcast.xml" "$WORK_DIR/canonical-appcast.xml"
 for mutation in legacy architecture host length version signature malformed; do
@@ -1029,6 +1275,17 @@ for test_case in \
   'scripts/install-doubao-driver.sh:true:true' \
   'scripts/verify-release-dependency-pins.sh:false:true' \
   'scripts/test-macos-release-flow.sh:false:true' \
+  'scripts/test-verify-release-asset-source.sh:false:true' \
+  'scripts/verify-release-asset-source.sh:false:true' \
+  'scripts/verify-release-metadata.sh:false:true' \
+  'scripts/verify-preview-ui-assets.sh:false:true' \
+  'scripts/test-private-platform.py:false:true' \
+  'scripts/run-release-stage.sh:false:true' \
+  'scripts/verify-release-contents.py:false:true' \
+  'scripts/release-assets.py:false:true' \
+  'config/release-assets.json:false:true' \
+  'config/release-dependencies.json:true:true' \
+  'config/future.json:true:false' \
   'scripts/verify-release-control-plane-diff.sh:true:true' \
   'scripts/verify-repository-governance.sh:false:false:true' \
   '.github/workflows/repository-governance.yml:false:false:true' \
@@ -1060,17 +1317,23 @@ for test_case in \
   print -r -- "$result" | /usr/bin/grep -Fxq "repository_only=$expected_repository"
   if [[ "$expected_product" == false && "$expected_release" == true ]]; then
     REPOSITORY_ROOT="$fixture_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" "$base_commit" HEAD
+    /bin/mkdir -p "$fixture_repo/Sources"
+    print -r -- product > "$fixture_repo/Sources/Product.swift"
+    /usr/bin/git -C "$fixture_repo" add .
+    /usr/bin/git -C "$fixture_repo" commit -q -m 'mixed release and product'
+    REPOSITORY_ROOT="$fixture_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$base_commit" HEAD | /usr/bin/grep -Fx 'product_change=true' >/dev/null
   fi
   if [[ "$expected_repository" == true ]]; then
     print -r -- documentation > "$fixture_repo/AGENTS.md"
     /usr/bin/git -C "$fixture_repo" add .
     /usr/bin/git -C "$fixture_repo" commit -q -m 'mixed governance and docs'
-    REPOSITORY_ROOT="$fixture_repo" /bin/bash "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$base_commit" HEAD | /usr/bin/grep -Fxq 'repository_only=true'
+    # Consume every classifier line so pipefail cannot turn an early match into SIGPIPE.
+    REPOSITORY_ROOT="$fixture_repo" /bin/bash "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$base_commit" HEAD | /usr/bin/grep -Fx 'repository_only=true' >/dev/null
     /bin/mkdir -p "$fixture_repo/Sources"
     print -r -- product > "$fixture_repo/Sources/Product.swift"
     /usr/bin/git -C "$fixture_repo" add .
     /usr/bin/git -C "$fixture_repo" commit -q -m 'mixed governance and product'
-    REPOSITORY_ROOT="$fixture_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$base_commit" HEAD | /usr/bin/grep -Fxq 'product_change=true'
+    REPOSITORY_ROOT="$fixture_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$base_commit" HEAD | /usr/bin/grep -Fx 'product_change=true' >/dev/null
   fi
   if REPOSITORY_ROOT="$fixture_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify 0000000000000000000000000000000000000000 HEAD > "$WORK_DIR/invalid-diff.log" 2>&1; then
     print -u2 "classifier accepted an invalid Git diff"
@@ -1078,11 +1341,100 @@ for test_case in \
   fi
 done
 
+# A release metadata-only diff may change only the two Info.plist version keys
+# and release history documentation. A second product key must fail closed.
+metadata_repo="$WORK_DIR/metadata-classification"
+/usr/bin/git init -q "$metadata_repo"
+/usr/bin/git -C "$metadata_repo" config user.name Fixture
+/usr/bin/git -C "$metadata_repo" config user.email fixture@example.invalid
+/bin/mkdir -p "$metadata_repo/Resources/zh-Hans.lproj" "$metadata_repo/Resources/en.lproj"
+cat > "$metadata_repo/Resources/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.example.metadata-fixture</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+</dict>
+</plist>
+PLIST
+print -r -- '## 1.0.0（预发布）' > "$metadata_repo/Resources/zh-Hans.lproj/ReleaseHistory.md"
+print -r -- '## 1.0.0 (Pre-release)' > "$metadata_repo/Resources/en.lproj/ReleaseHistory.md"
+/usr/bin/git -C "$metadata_repo" add .
+/usr/bin/git -C "$metadata_repo" commit -q -m 'metadata baseline'
+metadata_base="$(/usr/bin/git -C "$metadata_repo" rev-parse HEAD)"
+python3 - "$metadata_repo/Resources/Info.plist" 1.0.1 2 <<'PY'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+data = path.read_text()
+for key, value in (("CFBundleShortVersionString", sys.argv[2]), ("CFBundleVersion", sys.argv[3])):
+    data = re.sub(
+        rf"(<key>{key}</key>\s*<string>)[^<]*(</string>)",
+        lambda match: match.group(1) + value + match.group(2),
+        data,
+        count=1,
+    )
+path.write_text(data)
+PY
+python3 - "$metadata_repo/Resources/zh-Hans.lproj/ReleaseHistory.md" '## 1.0.1（预发布）' <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(sys.argv[2] + "\n\n- fixture\n\n" + path.read_text())
+PY
+python3 - "$metadata_repo/Resources/en.lproj/ReleaseHistory.md" '## 1.0.1 (Pre-release)' <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(sys.argv[2] + "\n\n- fixture\n\n" + path.read_text())
+PY
+/usr/bin/git -C "$metadata_repo" add .
+/usr/bin/git -C "$metadata_repo" commit -q -m 'release metadata'
+metadata_commit="$(/usr/bin/git -C "$metadata_repo" rev-parse HEAD)"
+metadata_result="$(REPOSITORY_ROOT="$metadata_repo" \
+  "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$metadata_base" HEAD)"
+print -r -- "$metadata_result" | /usr/bin/grep -Fxq 'release_metadata_only=true'
+print -r -- "$metadata_result" | /usr/bin/grep -Fxq 'product_change=false'
+print -r -- "$metadata_result" | /usr/bin/grep -Fxq 'release_checks=true'
+REPOSITORY_ROOT="$metadata_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" \
+  --require-release-metadata-only "$metadata_base" HEAD
+if REPOSITORY_ROOT="$metadata_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" \
+    "$metadata_base" HEAD > "$WORK_DIR/metadata-control-rejected.log" 2>&1; then
+  print -u2 "control-plane mode accepted a release metadata diff"
+  exit 1
+fi
+REPOSITORY_ROOT="$metadata_repo" RELEASE_METADATA_BASE="$metadata_base" \
+  "$ROOT/scripts/verify-release-metadata.sh" >/dev/null
+python3 - "$metadata_repo/Resources/Info.plist" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace("com.example.metadata-fixture", "com.example.metadata-changed", 1))
+PY
+/usr/bin/git -C "$metadata_repo" add .
+/usr/bin/git -C "$metadata_repo" commit -q -m 'non-version plist change'
+metadata_result="$(REPOSITORY_ROOT="$metadata_repo" \
+  "$ROOT/scripts/verify-release-control-plane-diff.sh" --classify "$metadata_base" HEAD)"
+print -r -- "$metadata_result" | /usr/bin/grep -Fxq 'release_metadata_only=false'
+print -r -- "$metadata_result" | /usr/bin/grep -Fxq 'product_change=true'
+if REPOSITORY_ROOT="$metadata_repo" "$ROOT/scripts/verify-release-control-plane-diff.sh" \
+    --require-release-metadata-only "$metadata_base" HEAD > "$WORK_DIR/metadata-require-rejected.log" 2>&1; then
+  print -u2 "release metadata check accepted a non-version plist change"
+  exit 1
+fi
+print "RELEASE METADATA CLASSIFICATION FIXTURE PASS"
+
 # Pin scheduling boundaries and execute the actual required-context shell gate.
 ci_workflow="$ROOT/.github/workflows/mac-ci.yml"
 classifier_job="$(/usr/bin/awk '/^  classify_changes:/ { capture=1 } /^  public_test:/ { exit } capture { print }' "$ci_workflow")"
 print -r -- "$classifier_job" | /usr/bin/grep -Fq 'runs-on: ubuntu-latest'
-/usr/bin/grep -Fq 'runs-on: ${{ (needs.classify_changes.outputs.product_change == '\''true'\'' || needs.classify_changes.outputs.release_checks == '\''true'\'') && '\''xcode-27'\'' || '\''ubuntu-latest'\'' }}' "$ci_workflow"
+/usr/bin/grep -Fq 'runs-on: ${{ (needs.classify_changes.outputs.product_change == '\''true'\'' || (needs.classify_changes.outputs.release_checks == '\''true'\'' && needs.classify_changes.outputs.release_metadata_only != '\''true'\'')) && '\''xcode-27'\'' || '\''ubuntu-latest'\'' }}' "$ci_workflow"
 if print -r -- "$classifier_job" | /usr/bin/grep -Eq 'private dependency|SAYALL_PRIVATE_PLATFORM_DEPLOY_KEY|verify-release-dependency-pins.sh resolve'; then
   print -u2 "public macOS CI classifier must not inspect private dependencies"
   exit 1
@@ -1117,15 +1469,66 @@ fake_runner="$WORK_DIR/fake-variant-runner"
 print -r -- '#!/bin/zsh
 set -euo pipefail
 print -r -- "$RELEASE_VARIANT" >> "$VARIANT_LOG"
+print -r -- "lane $RELEASE_VARIANT running"
 ' > "$fake_runner"
 /bin/chmod 755 "$fake_runner"
 for parallel_mode in 0 1; do
   variant_log="$WORK_DIR/variants-$parallel_mode.log"
-  PARALLEL_RELEASE_VARIANTS="$parallel_mode" GENERATE_SPARKLE_UPDATE=0 \
+  lane_log_dir="$WORK_DIR/variants-$parallel_mode-lanes"
+  # 这里用假 runner 验证并行调度，构建树本身不是发布候选：显式关闭基线门禁。
+  RELEASE_BASELINE_CHECK=0 \
+  RELEASE_VARIANT_LOG_DIR="$lane_log_dir" \
+    PARALLEL_RELEASE_VARIANTS="$parallel_mode" GENERATE_SPARKLE_UPDATE=0 \
     RELEASE_VARIANT_RUNNER="$fake_runner" VARIANT_LOG="$variant_log" \
     "$ROOT/scripts/notarize-release.sh" --all > "$WORK_DIR/variants-$parallel_mode.output"
   [[ "$(LC_ALL=C sort "$variant_log")" == $'apple-silicon\nintel' ]]
+  if [[ "$parallel_mode" == "1" ]]; then
+    # 并行 lane 必须各自留一份独立日志，失败时才能定位到具体架构。
+    [[ -f "$lane_log_dir/apple-silicon.log" ]]
+    [[ -f "$lane_log_dir/intel.log" ]]
+    /usr/bin/grep -Fq 'lane apple-silicon running' "$lane_log_dir/apple-silicon.log"
+    /usr/bin/grep -Fq 'lane intel running' "$lane_log_dir/intel.log"
+    ! /usr/bin/grep -Fq 'lane intel running' "$lane_log_dir/apple-silicon.log"
+    ! /usr/bin/grep -Fq 'lane apple-silicon running' "$lane_log_dir/intel.log"
+    # 实时输出仍然保留在终端上。
+    /usr/bin/grep -Fq 'lane apple-silicon running' "$WORK_DIR/variants-1.output"
+    /usr/bin/grep -Fq 'lane intel running' "$WORK_DIR/variants-1.output"
+  else
+    # 串行模式沿用单进程输出，不产生 lane 日志目录。
+    [[ ! -d "$lane_log_dir" ]]
+  fi
 done
+
+# Private Draft fast path: Apple Silicon only by default, Intel only on request.
+for private_mode in default include-intel; do
+  private_log="$WORK_DIR/private-$private_mode.log"
+  private_lane_dir="$WORK_DIR/private-$private_mode-lanes"
+  private_args=(--private-draft)
+  if [[ "$private_mode" == "include-intel" ]]; then
+    private_args+=(--include-intel)
+  fi
+  RELEASE_BASELINE_CHECK=0 \
+  RELEASE_VARIANT_LOG_DIR="$private_lane_dir" \
+    GENERATE_SPARKLE_UPDATE=0 \
+    RELEASE_VARIANT_RUNNER="$fake_runner" VARIANT_LOG="$private_log" \
+    "$ROOT/scripts/notarize-release.sh" "${private_args[@]}" \
+    > "$WORK_DIR/private-$private_mode.output"
+  /usr/bin/grep -Fxq 'apple-silicon' "$private_log"
+  if [[ "$private_mode" == "include-intel" ]]; then
+    /usr/bin/grep -Fxq 'intel' "$private_log"
+    [[ "$(/usr/bin/wc -l < "$private_log" | /usr/bin/tr -d ' ')" == "2" ]]
+  else
+    [[ "$(/usr/bin/wc -l < "$private_log" | /usr/bin/tr -d ' ')" == "1" ]]
+  fi
+done
+if RELEASE_BASELINE_CHECK=0 GENERATE_SPARKLE_UPDATE=0 \
+    RELEASE_VARIANT_RUNNER="$fake_runner" VARIANT_LOG="$WORK_DIR/private-invalid.log" \
+    "$ROOT/scripts/notarize-release.sh" --include-intel \
+    > "$WORK_DIR/private-invalid.output" 2>&1; then
+  print -u2 "notarize-release accepted --include-intel without --private-draft"
+  exit 1
+fi
+/usr/bin/grep -Fq -- '--include-intel requires --private-draft' "$WORK_DIR/private-invalid.output"
 print "CI CLASSIFICATION AND VARIANT ENTRY FIXTURE PASS"
 )
 
@@ -1193,9 +1596,9 @@ print "LOCALIZATION GATE FIXTURE PASS"
 )
 
 case "${1:-all}" in
-  all) test_ci_classification; test_flow; test_localizations; test_metadata ;;
-  flow) test_ci_classification; test_flow; test_localizations ;;
+  all) test_ci_classification; test_flow; test_localizations; test_metadata; node --test "$SCRIPT_ROOT/scripts/test-update-feed-sync.mjs" ;;
+  flow) test_ci_classification; test_flow; test_localizations; node --test "$SCRIPT_ROOT/scripts/test-update-feed-sync.mjs" ;;
   metadata) test_metadata ;;
-  ready-ci) test_ready_ci ;;
+  ready-ci) test_ready_ci; test_metadata_ready_ci ;;
   *) print -u2 "usage: $0 [all|flow|metadata|ready-ci]"; exit 2 ;;
 esac

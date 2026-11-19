@@ -66,25 +66,74 @@ enum RemoteDeviceNamePolicy {
         }
     }
 
-    static func defaultMappingProfile(
-        from profiles: [RemoteDeviceProfile]
-    ) -> RemoteDeviceProfile? {
-        profiles.first { $0.model == .rc001 || $0.model == .rc003 }
+    /// 卡片区不重复展示同一台设备。
+    ///
+    /// 指纹会随接口、重新配对或指纹算法版本变化，同一台遥控器因此可能留下两条档案；
+    /// 旧档案还把序列号存成了设备名，于是两张卡片标题相同、第二行也是同一个序列号。
+    /// 两台真实设备不可能共用序列号，所以「同型号 + 同一个像序列号的名字」只保留一条：
+    /// 优先正在用的那条，其余留在前面的那条。
+    ///
+    /// 只影响展示，不改写已保存的档案——合并档案会连带丢掉另一条上配置过的映射。
+    static func cardsWithoutRepeatedSerial(
+        _ profiles: [RemoteDeviceProfile],
+        selectedProfileID: UUID?,
+        isConnected: (RemoteDeviceProfile) -> Bool,
+        systemName: (RemoteDeviceProfile) -> String?
+    ) -> [RemoteDeviceProfile] {
+        // 正在编辑的那条不参与去重：藏掉它，页面就会在编辑一台卡片上看不到的设备，
+        // 用户会以为配置丢了。宁可这一组暂时显示两张，也不让编辑目标消失。
+        let pinnedKey = profiles.first { $0.id == selectedProfileID }
+            .flatMap { serialKey(for: $0, systemName: systemName) }
+        var result: [RemoteDeviceProfile] = []
+        var indexByKey: [String: Int] = [:]
+        for profile in profiles {
+            guard let key = serialKey(for: profile, systemName: systemName), key != pinnedKey else {
+                result.append(profile)
+                continue
+            }
+            guard let index = indexByKey[key] else {
+                indexByKey[key] = result.count
+                result.append(profile)
+                continue
+            }
+            // 同一台设备只留一张：优先正在用的那条，其次留在前面的那条。
+            if isConnected(profile), !isConnected(result[index]) {
+                result[index] = profile
+            }
+        }
+        return result
     }
 
-    /// 链路就绪事件是否接管按键页的选中态。
+    /// 名字不像序列号（例如「客厅」）时无法证明是同一台设备，返回 nil 表示不参与去重。
+    private static func serialKey(
+        for profile: RemoteDeviceProfile,
+        systemName: (RemoteDeviceProfile) -> String?
+    ) -> String? {
+        guard let name = systemName(profile), RemoteDeviceIdentity.looksLikeSerial(name) else {
+            return nil
+        }
+        return "\(profile.model.rawValue)|\(name.uppercased())"
+    }
+
+    /// 上次选中的遥控器缺席时，接管画布的档案。
     ///
-    /// 多遥控器同时在线时按键页优选小米画布：Chromecast 不得抢走已连接的小米。
-    /// 启动顺序不稳定（Chromecast 常比小米先 ready），只按「谁后连谁赢」会让页面
-    /// 永远停在 Chromecast。其余情况保持「连接即选中」，与小米链路的
-    /// `activateRemoteProfile` 一致。
-    static func shouldAdoptConnectionSelection(
-        for incoming: XiaomiRemoteModel,
-        isAlreadySelected: Bool,
-        hasConnectedXiaomi: Bool
-    ) -> Bool {
-        guard !isAlreadySelected else { return false }
-        return !(incoming.isChromecastRemote && hasConnectedXiaomi)
+    /// 只在这里用到型号顺序，而且前提是「历史偏好已经确定不成立」：用户卖掉了原来的
+    /// 遥控器、换成了别的设备。此时没有历史可依据，才按卡片顺序取第一台在线的
+    /// （小米 > Siri Remote > Chromecast）。
+    ///
+    /// 不能用型号顺序决定正常启动时显示谁——那会让「卖掉小米、换成 Chromecast」的用户
+    /// 永远看到已经不在的小米画布。
+    static func fallbackSelection(
+        from profiles: [RemoteDeviceProfile],
+        isConnected: (RemoteDeviceProfile) -> Bool,
+        modelName: (RemoteDeviceProfile) -> String,
+        systemName: (RemoteDeviceProfile) -> String?
+    ) -> RemoteDeviceProfile? {
+        sortedForCards(
+            profiles.filter(isConnected),
+            modelName: modelName,
+            systemName: systemName
+        ).first
     }
 
     private static func cardFamilyOrder(_ model: XiaomiRemoteModel) -> Int {

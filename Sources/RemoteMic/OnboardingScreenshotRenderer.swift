@@ -97,7 +97,11 @@ enum OnboardingScreenshotRenderer {
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             throw RenderingError.bitmapCreationFailed
         }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            _ = defaults.synchronize()
+            TemporaryUserDefaults.removeSuite(suiteName)
+        }
 
         let settings = AppSettings(defaults: defaults)
         settings.applicationLanguage = screenshotLanguage.appLanguage
@@ -149,10 +153,31 @@ enum OnboardingScreenshotRenderer {
         }
         settings.setOnboardingVoiceTool(requestedVoiceTool ?? .doubao)
         settings.setOnboardingControlSource(controlSource)
+        if let modelName = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL"
+        ], let remoteModel = XiaomiRemoteModel(rawValue: modelName) {
+            let profileID = settings.registerHIDRemote(
+                fingerprint: "onboarding-screenshot-\(remoteModel.rawValue)"
+            )
+            settings.updateRemoteProfileModel(profileID, model: remoteModel)
+            settings.selectRemoteProfile(profileID)
+            if let onboardingModel = OnboardingXiaomiRemoteModel(rawValue: remoteModel.rawValue) {
+                settings.setOnboardingXiaomiRemoteModel(onboardingModel, source: "screenshot")
+            }
+        }
         if controlSource == .siriRemote {
             settings.setOnboardingAppleRemoteGeneration(
                 requestedAppleRemoteGeneration ?? .generation7
             )
+        }
+        if controlSource == .xiaomiRemote {
+            if ProcessInfo.processInfo.environment[
+                "REMOTE_MIC_ONBOARDING_SCREENSHOT_XIAOMI_MODEL"
+            ] == "none" {
+                settings.setOnboardingXiaomiRemoteModel(nil)
+            } else if settings.onboardingXiaomiRemoteModel == nil {
+                settings.setOnboardingXiaomiRemoteModel(.rc003, source: "screenshot_default")
+            }
         }
         let screenshotAudioName = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_ONBOARDING_SCREENSHOT_AUDIO_NAME"
@@ -190,9 +215,16 @@ enum OnboardingScreenshotRenderer {
         NSApp.setActivationPolicy(.regular)
         defer { NSApp.appearance = previousAppearance }
 
+        // 音频页的“已选中设备”是修好 Siri Remote 门禁后的可见结果，默认夹具故意不选设备，
+        // 需要出这一态时显式打开，避免改变其余页面的既有基线。
+        let selectsDeviceOnAudioStep = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_ONBOARDING_SCREENSHOT_AUDIO_SELECTED"
+        ] == "1"
         for (step, filename) in pages(for: controlMethod) {
             settings.selectedAudioDeviceUID = switch step {
             case .voiceTest, .controls, .complete:
+                DoubaoAudioDevicePolicy.deviceUID
+            case .audio where selectsDeviceOnAudioStep:
                 DoubaoAudioDevicePolicy.deviceUID
             default:
                 ""
@@ -215,6 +247,9 @@ enum OnboardingScreenshotRenderer {
                 remoteInputDiagnosticOverride: remoteInputDiagnostic,
                 siriRemotePackageInstalledOverride: ProcessInfo.processInfo.environment[
                     "REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_INSTALLED"
+                ].map { $0 == "1" },
+                siriRemoteComponentInstalledOverride: ProcessInfo.processInfo.environment[
+                    "REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_COMPONENT_INSTALLED"
                 ].map { $0 == "1" },
                 // 离屏渲染没有前台会话，周期权限刷新照常执行，保持与生产一致的状态。
                 permissionRefreshInForegroundOverride: true,

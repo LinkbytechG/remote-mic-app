@@ -326,7 +326,7 @@ struct RemoteNativeKeyMapperTests {
 
     private func testDefaults() throws -> (defaults: UserDefaults, cleanup: () -> Void) {
         let suite = "RemoteNativeKeyMapperTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         return (defaults, { defaults.removePersistentDomain(forName: suite) })
     }
 }

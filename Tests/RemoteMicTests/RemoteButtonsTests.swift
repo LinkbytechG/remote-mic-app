@@ -333,10 +333,31 @@ struct RemoteButtonsTests {
         #expect(ButtonAction.commandClose.category == .basicKeys)
         #expect(ButtonAction.commandUndo.category == .basicKeys)
         #expect(ButtonAction.commandDelete.category == .basicKeys)
+        // 窗口与标签页动作是纯按键组合，和既有关闭/退出同属基础按键。
+        #expect(ButtonAction.commandMinimize.category == .basicKeys)
+        #expect(ButtonAction.toggleFullScreen.category == .basicKeys)
+        #expect(ButtonAction.commandNewTab.category == .basicKeys)
+        #expect(ButtonAction.commandPreviousTab.category == .basicKeys)
+        #expect(ButtonAction.commandNextTab.category == .basicKeys)
+        #expect(ButtonAction.commandNextWindow.category == .basicKeys)
+        #expect(ButtonAction.commandHide.category == .basicKeys)
+        #expect(ButtonAction.commandNew.category == .basicKeys)
+        // 系统窗口管理手势归「系统与媒体」，与显示桌面、切换 App 同级。
+        #expect(ButtonAction.missionControl.category == .systemAndMedia)
+        #expect(ButtonAction.applicationWindows.category == .systemAndMedia)
+        #expect(ButtonAction.spaceLeft.category == .systemAndMedia)
+        #expect(ButtonAction.spaceRight.category == .systemAndMedia)
+        #expect(ButtonAction.lockScreen.category == .systemAndMedia)
+        #expect(ButtonAction.screenshot.category == .systemAndMedia)
         #expect(ButtonAction.volumeUp.category == .systemAndMedia)
         #expect(ButtonAction.previousCommandLeft.category == .systemAndMedia)
         #expect(ButtonAction.nextCommandRight.category == .systemAndMedia)
-        #expect(ButtonAction.customShortcut.category == .custom)
+        // 自定义快捷键拥有紧接基础按键的独立分类。
+        #expect(ButtonAction.customShortcut.category == .customShortcuts)
+        #expect(Array(ButtonActionCategory.allCases.prefix(2)) == [.basicKeys, .customShortcuts])
+        #expect(ButtonAction.focusInput.category == .custom)
+        // 组合动作是独立分类，和「常用语」同级。
+        #expect(ButtonAction.combinationAction.category == .combinations)
         #expect(ButtonAction.openCustomApplication.category == .applications)
         #expect(ButtonAction.openCodex.category == .applications)
         #expect(ButtonAction.openCommonPhrases.category == .commonPhrases)
@@ -363,6 +384,21 @@ struct RemoteButtonsTests {
         #expect(!ButtonAction.commandFind.allowsRepeat)
         #expect(!ButtonAction.commandSave.allowsRepeat)
         #expect(!ButtonAction.commandDelete.allowsRepeat)
+        // 按住不放不应该反复最小化窗口或连开标签页。
+        #expect(!ButtonAction.commandMinimize.allowsRepeat)
+        #expect(!ButtonAction.toggleFullScreen.allowsRepeat)
+        #expect(!ButtonAction.commandNewTab.allowsRepeat)
+        #expect(!ButtonAction.commandPreviousTab.allowsRepeat)
+        #expect(!ButtonAction.commandNextTab.allowsRepeat)
+        #expect(!ButtonAction.commandNextWindow.allowsRepeat)
+        #expect(!ButtonAction.commandHide.allowsRepeat)
+        #expect(!ButtonAction.commandNew.allowsRepeat)
+        #expect(!ButtonAction.missionControl.allowsRepeat)
+        #expect(!ButtonAction.applicationWindows.allowsRepeat)
+        #expect(!ButtonAction.spaceLeft.allowsRepeat)
+        #expect(!ButtonAction.spaceRight.allowsRepeat)
+        #expect(!ButtonAction.lockScreen.allowsRepeat)
+        #expect(!ButtonAction.screenshot.allowsRepeat)
         #expect(!ButtonAction.previousCommandLeft.allowsRepeat)
         #expect(!ButtonAction.nextCommandRight.allowsRepeat)
         #expect(ButtonAction.arrowUp.allowsRepeat)
@@ -529,7 +565,7 @@ struct RemoteButtonsTests {
         }
 
         let suiteName = "RemoteButtonsTests.scrollActions.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         AppSettings(defaults: defaults).setAction(.scrollUp, for: .up)
         AppSettings(defaults: defaults).setAction(.scrollDown, for: .down)
@@ -754,7 +790,7 @@ struct RemoteButtonsTests {
 
     @Test func rawHardwareRepeatStaysLatchedUntilAStableRelease() throws {
         let suiteName = "RemoteButtonsTests.rawHardwareRepeat.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let monitor = HIDRemoteMonitor(settings: AppSettings(defaults: defaults))
 
@@ -793,7 +829,7 @@ struct RemoteButtonsTests {
         }
 
         let suiteName = "RemoteButtonsTests.stableReleaseTiming.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -854,7 +890,7 @@ struct RemoteButtonsTests {
         }
 
         let suiteName = "RemoteButtonsTests.reportTimestamp.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -905,7 +941,7 @@ struct RemoteButtonsTests {
 
     @Test func rapidPressOptInLetsNonRepeatableActionsFireOnEveryRawPress() throws {
         let suiteName = "RemoteButtonsTests.rapidPress.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let monitor = HIDRemoteMonitor(settings: AppSettings(defaults: defaults))
         let otherApp = PresetApplication.codex.bundleIdentifier
@@ -967,7 +1003,7 @@ struct RemoteButtonsTests {
 
     @Test func rapidPressOptInDefaultsOffAndPersistsWithMappings() throws {
         let suiteName = "RemoteButtonsTests.rapidPressSettings.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         #expect(!settings.allowsRapidPress(for: .volumeDown))
@@ -994,14 +1030,14 @@ struct RemoteButtonsTests {
 
     @Test func rapidPressOptInTravelsWithExportedConfigurationAndToleratesOlderFiles() throws {
         let sourceSuiteName = "RemoteButtonsTests.rapidPressExport.\(UUID().uuidString)"
-        let sourceDefaults = try #require(UserDefaults(suiteName: sourceSuiteName))
+        let sourceDefaults = try #require(TestUserDefaults(suiteName: sourceSuiteName))
         defer { sourceDefaults.removePersistentDomain(forName: sourceSuiteName) }
         let source = AppSettings(defaults: sourceDefaults)
         source.setAllowsRapidPress(true, for: .volumeDown)
         let exported = try source.exportedConfigurationData()
 
         let targetSuiteName = "RemoteButtonsTests.rapidPressImport.\(UUID().uuidString)"
-        let targetDefaults = try #require(UserDefaults(suiteName: targetSuiteName))
+        let targetDefaults = try #require(TestUserDefaults(suiteName: targetSuiteName))
         defer { targetDefaults.removePersistentDomain(forName: targetSuiteName) }
         let target = AppSettings(defaults: targetDefaults)
         try target.importConfiguration(from: exported)
@@ -1049,7 +1085,7 @@ struct RemoteButtonsTests {
         }
 
         let suiteName = "RemoteButtonsTests.frontmostRepeat.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let monitor = HIDRemoteMonitor(settings: AppSettings(defaults: defaults))
         #expect(monitor.shouldAcceptRawPress(
@@ -1149,7 +1185,22 @@ struct RemoteButtonsTests {
         #expect(ButtonAction.commandDelete.detailedDisplayName(using: localization) == "Command + Delete")
         #expect(ButtonAction.arrowLeft.visualDisplayName(using: localization) == "←")
         #expect(ButtonAction.arrowLeft.detailedDisplayName(using: localization) == "Left")
-        #expect(ButtonAction.volumeUp.visualDisplayName(using: localization) == "Increase System Volume")
+        #expect(ButtonAction.volumeUp.visualDisplayName(using: localization) == "Volume Up")
+        #expect(ButtonAction.commandMinimize.visualDisplayName(using: localization) == "⌘M")
+        #expect(ButtonAction.commandMinimize.detailedDisplayName(using: localization) == "Command + M")
+        #expect(ButtonAction.toggleFullScreen.visualDisplayName(using: localization) == "⌃⌘F")
+        #expect(ButtonAction.commandNewTab.visualDisplayName(using: localization) == "⌘T")
+        #expect(ButtonAction.commandPreviousTab.visualDisplayName(using: localization) == "⇧⌘[")
+        #expect(ButtonAction.commandNextTab.visualDisplayName(using: localization) == "⇧⌘]")
+        #expect(ButtonAction.commandNextWindow.visualDisplayName(using: localization) == "⌘`")
+        #expect(ButtonAction.commandHide.visualDisplayName(using: localization) == "⌘H")
+        #expect(ButtonAction.commandNew.visualDisplayName(using: localization) == "⌘N")
+        #expect(ButtonAction.missionControl.visualDisplayName(using: localization) == "⌃↑")
+        #expect(ButtonAction.applicationWindows.visualDisplayName(using: localization) == "⌃↓")
+        #expect(ButtonAction.spaceLeft.visualDisplayName(using: localization) == "⌃←")
+        #expect(ButtonAction.spaceRight.visualDisplayName(using: localization) == "⌃→")
+        #expect(ButtonAction.lockScreen.visualDisplayName(using: localization) == "⌃⌘Q")
+        #expect(ButtonAction.screenshot.visualDisplayName(using: localization) == "⇧⌘3")
     }
 
     @Test func customShortcutPreservesRightCommandDeviceSide() {
@@ -1451,7 +1502,8 @@ struct RemoteButtonsTests {
             keyStatePoster: { code, isDown, flags in
                 posted.append((code, isDown, flags))
                 return true
-            }
+            },
+            scheduler: { _, event in event(); return nil }
         )
 
         #expect(session.trigger())
@@ -1464,7 +1516,7 @@ struct RemoteButtonsTests {
         #expect(session.cancel())
         #expect(!session.moveSelection(left: true))
 
-        #expect(posted.count == 10)
+        #expect(posted.count == 12)
         #expect(posted[0].0 == KeyboardInjector.leftCommandKeyCode)
         #expect(posted[0].1)
         #expect(posted[0].2 == .maskCommand)
@@ -1492,9 +1544,201 @@ struct RemoteButtonsTests {
         #expect(posted[6].2 == .maskCommand)
         #expect(posted[7].2 == .maskCommand)
         #expect(posted[8].2 == .maskCommand)
-        #expect(posted[9].0 == KeyboardInjector.leftCommandKeyCode)
-        #expect(!posted[9].1)
+        #expect(posted[9].0 == KeyboardInjector.leftOptionKeyCode)
+        #expect(posted[9].1)
+        #expect(posted[9].2 == [.maskCommand, .maskAlternate])
+        #expect(posted[10].0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(!posted[10].1)
+        #expect(posted[10].2 == .maskAlternate)
+        #expect(posted[11].0 == KeyboardInjector.leftOptionKeyCode)
+        #expect(!posted[11].1)
+        #expect(posted[11].2.isEmpty)
+    }
+
+    /// 切换器里松开 ⌘ 就是确认高亮 App；取消必须先在 ⌘ 仍按住时发 Escape。
+    @Test func appSwitcherSessionCancelSendsEscapeBeforeReleasingCommand() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.moveSelection(left: false))
+        #expect(session.cancel())
+        #expect(!session.isActive)
+        #expect(!session.isWindowPickerActive)
+
+        // ⌘ down、Tab down/up、→ down/up、Esc down/up、⌘ up
+        #expect(posted.count == 8)
+        #expect(posted[5].0 == 53)
+        #expect(posted[5].1)
+        #expect(posted[5].2 == .maskCommand)
+        #expect(posted[6].0 == 53)
+        #expect(!posted[6].1)
+        #expect(posted[6].2 == .maskCommand)
+        #expect(posted[7].0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(!posted[7].1)
+        #expect(posted[7].2.isEmpty)
+    }
+
+    /// 系统已自己关掉切换器（鼠标点了别处）时不能再补 Escape，否则它会落到被点击的 App 上。
+    @Test func appSwitcherSessionCancelWithoutDismissalOnlyReleasesCommand() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.cancel(dismissSwitcher: false))
+        #expect(!session.isActive)
+        #expect(posted.count == 4)
+        #expect(!posted.contains { $0.0 == 53 })
+        #expect(posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(posted.last?.1 == false)
+    }
+
+    /// 窗口层里系统自己关掉切换器时同样不能补 Escape。
+    @Test func appSwitcherSessionCancelInWindowPickerWithoutDismissalOnlyReleasesCommand() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.moveWindowSelection(up: true))
+        posted.removeAll()
+        #expect(session.cancel(dismissSwitcher: false))
+        #expect(!session.isActive)
+        #expect(!session.isWindowPickerActive)
+        // 窗口层的 ⌘ 已在进入时释放，这里既不能补 Escape，也不应再重复投递 ⌘。
+        #expect(posted.isEmpty)
+    }
+
+    /// Escape 发送失败也不能把 ⌘ 留在按下状态，否则之后所有按键都会变成快捷键。
+    @Test func appSwitcherSessionCancelReleasesCommandWhenEscapeFails() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return code != 53
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(!session.cancel())
+        #expect(!session.isActive)
+        #expect(posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(posted.last?.1 == false)
+    }
+
+    @Test func appSwitcherSessionForceReleasesModifiersWhenScheduledReleaseIsLost() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, _ in nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.confirm())
+        #expect(session.hasPendingRelease)
+        #expect(posted.count == 4)
+        #expect(session.forceReleaseModifiersIfNeeded())
+        #expect(!session.hasPendingRelease)
+        #expect(session.forceReleaseModifiersIfNeeded())
+        #expect(posted.count == 6)
+        #expect(posted[4].0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(!posted[4].1)
+        #expect(posted[4].2.isEmpty)
+        #expect(posted[5].0 == KeyboardInjector.leftOptionKeyCode)
+        #expect(!posted[5].1)
+        #expect(posted[5].2.isEmpty)
+    }
+
+    @Test func appSwitcherWindowSelectionEntersExposeThenUsesPlainKeys() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.moveWindowSelection(up: false))
+        #expect(session.moveWindowSelection(up: false))
+        #expect(session.moveSelection(left: false))
+        #expect(session.confirm())
+        #expect(!session.isActive)
+
+        #expect(posted.map { $0.0 } == [
+            KeyboardInjector.leftCommandKeyCode, 48, 48,
+            125, 125, KeyboardInjector.leftCommandKeyCode,
+            125, 125, 124, 124, 36, 36,
+        ])
+        #expect(posted[3].2 == .maskCommand)
+        #expect(posted[4].2 == .maskCommand)
+        #expect(posted[5].2.isEmpty)
+        #expect(posted[6].2.isEmpty)
+        #expect(posted[7].2.isEmpty)
+        #expect(posted[8].2.isEmpty)
         #expect(posted[9].2.isEmpty)
+        #expect(posted[10].2.isEmpty)
+        #expect(posted[11].2.isEmpty)
+    }
+
+    @Test func appSwitcherWindowSelectionCancelSendsEscape() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.moveWindowSelection(up: true))
+        #expect(session.cancel())
+        #expect(!session.isActive)
+        #expect(Array(posted.suffix(2).map { $0.0 }) == [53, 53])
+        #expect(posted.suffix(2).allSatisfy { $0.2.isEmpty })
+    }
+
+    @Test func appSwitcherConfirmReleasesCommandWithoutOptionWhenOptionCannotBePressed() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, isDown, flags in
+                if code == KeyboardInjector.leftOptionKeyCode, isDown { return false }
+                posted.append((code, isDown, flags))
+                return true
+            },
+            scheduler: { _, event in event(); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.confirm())
+        #expect(!session.isActive)
+        #expect(posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(posted.last?.1 == false)
+        #expect(posted.last?.2.isEmpty == true)
+        #expect(!posted.contains { $0.0 == KeyboardInjector.leftOptionKeyCode })
     }
 
     @Test func appleRemoteCircularNavigationAccumulatesNoiseAndPreservesDirection() {
@@ -1530,10 +1774,809 @@ struct RemoteButtonsTests {
         #expect(AppleRemoteCircularNavigationAccumulator.movesLeft(for: 1))
     }
 
+    @Test func appSwitcherSingleWindowConfirmActivatesTheOnlyWindow() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherSingleWindow.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        // 前台是另一个 App：表示这次直达没有落地。
+        var frontmost = PresetApplication.codex.bundleIdentifier
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var activatedPids: [pid_t] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { frontmost },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 1 },
+            windowActivator: { pid in
+                activatedPids.append(pid)
+                return true
+            },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { 9999 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-single-window", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.down)
+        // 单窗口直达：松开 ⌘ 让切换器激活目标，不进窗口层。
+        #expect(posted.contains { $0.0 == 55 && !$0.1 })
+        #expect(!posted.contains { $0.0 == 125 })
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming
+                .appSwitcherSingleWindowDirectRestoreMilliseconds
+        )
+        #expect(activatedPids == [4321])
+
+        // 600ms 的重申兜底：前台不是目标进程时再补一次。
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming
+                .appSwitcherSingleWindowDirectRestoreMilliseconds
+                + HIDRemoteTiming.appSwitcherSingleWindowReassertMilliseconds
+        )
+        #expect(activatedPids == [4321, 4321])
+
+        // 直达没有落地时（前台不是目标进程），返回键补 Esc。
+        press(.back)
+        #expect(posted.contains { $0.0 == 53 })
+    }
+
+    @Test func appSwitcherConfirmedWindowLayerCanBeClosedWithBack() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherBackEscape.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var frontmost = PresetApplication.codex.bundleIdentifier
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { frontmost },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { 9999 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-back-escape", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.down)
+        press(.ok)
+        // 确认没生效：前台仍是原 App，窗口层还开着。
+        frontmost = PresetApplication.codex.bundleIdentifier
+        press(.back)
+        #expect(posted.contains { $0.0 == 53 })
+    }
+
+    @Test func appSwitcherEnsuresForegroundAfterMultiWindowConfirm() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherEnsureFront.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var frontmost = PresetApplication.codex.bundleIdentifier
+        var frontPid: pid_t = 9999
+        var activatedPids: [pid_t] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { frontmost },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { _, _, _ in true },
+            windowCounter: { _ in 2 },
+            applicationActivator: { pid in
+                activatedPids.append(pid)
+                return true
+            },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { frontPid }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-ensure-front", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.down)
+        press(.down) // 选中一个窗口：OK 才会响应
+        press(.ok)
+        // 确认后前台仍是原 App：300ms 时应该补一次 App 激活。
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming.appSwitcherForegroundEnsureMilliseconds
+        )
+        #expect(activatedPids == [4321])
+
+        // 切换成功时不应再打扰。
+        press(.menu)
+        press(.down)
+        press(.down)
+        frontmost = PresetApplication.safari.bundleIdentifier
+        frontPid = 4321
+        press(.ok)
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming.appSwitcherForegroundEnsureMilliseconds * 2
+        )
+        #expect(activatedPids.count == 1)
+    }
+
+    @Test func appSwitcherIgnoresOKUntilWindowHighlighted() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherOKGate.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { 9999 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-ok-gate", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.down)
+        press(.ok)
+        // 没有高亮：OK 不响应，会话保持。
+        #expect(!posted.contains { $0.0 == 36 })
+        press(.up)
+        // 有高亮后：OK 发 Return。
+        press(.ok)
+        #expect(posted.contains { $0.0 == 36 })
+    }
+
+    @Test func appSwitcherUpArrowAlsoEntersWindowLayer() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherUpEnter.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { 9999 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-up-enter", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.up)
+        // 上键进入窗口层：进入动作也是 ⌘↓。
+        #expect(posted.contains { $0.0 == 125 && $0.1 && $0.2.contains(.maskCommand) })
+        #expect(posted.contains { $0.0 == 125 && !$0.1 && $0.2.contains(.maskCommand) })
+        let countAfterEntry = posted.count
+        press(.up)
+        // 之后的上键是普通方向键；第一次还会先释放 ⌘。
+        #expect(posted.contains { $0.0 == 126 && !$0.2.contains(.maskCommand) })
+        #expect(posted.count == countAfterEntry + 3)
+    }
+
+    @Test func appSwitcherSwallowsOtherButtonsDuringSession() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherSwallow.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { 9999 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-swallow", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.down)
+        let countAfterEntry = posted.count
+        // 会话期间音量、主页、TV 等按键全部吞掉。
+        press(.volumeUp)
+        press(.home)
+        press(.tv)
+        press(.volumeDown)
+        #expect(posted.count == countAfterEntry)
+        // 会话仍然存活：返回键还是能退出（Esc）。
+        press(.back)
+        #expect(posted.contains { $0.0 == 53 })
+    }
+
+    @Test func appSwitcherBoundButtonActsAsTabDuringSession() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherTabBtn.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        settings.setAction(.appSwitcher, for: .tv)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherSelectedApplication: {
+                KeyboardInjector.AppSwitcherSelection(
+                    processIdentifier: 4321,
+                    bundleIdentifier: PresetApplication.safari.bundleIdentifier
+                )
+            },
+            frontmostProcessIdentifier: { 9999 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-tab-btn", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        press(.tv)
+        // 会话中绑定了切换器的 TV 键等价于菜单键：发 Tab 切到下一个 App。
+        #expect(posted.contains { $0.0 == 48 && $0.1 })
+        #expect(posted.contains { $0.0 == 48 && !$0.1 })
+    }
+
+    @Test func appSwitcherKeepsSessionRegardlessOfAccessibilityState() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherHudWatch.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var hudState: KeyboardInjector.AppSwitcherHudState = .visible(
+            selectedBundleIdentifier: PresetApplication.safari.bundleIdentifier
+        )
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherHudState: { hudState }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-hud-watch", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        let poll = HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds
+        // HUD 可见：会话保持。
+        scheduler.advance(toMilliseconds: poll * 4)
+        #expect(!posted.contains { $0.0 == 55 && !$0.1 })
+        // 读不到 HUD 状态：不能当成关闭。
+        hudState = .unreadable
+        scheduler.advance(toMilliseconds: poll * 6)
+        #expect(!posted.contains { $0.0 == 55 && !$0.1 })
+        // 辅助功能说 HUD 已经消失：仍然不能结束会话。
+        // macOS 13 真机日志里这个信号会在切换器明明开着时随机出现，
+        // 据此收尾会让切换器一闪而过并直接切到附近的 App。
+        hudState = .absent
+        scheduler.advance(toMilliseconds: poll * 12)
+        #expect(!posted.contains { $0.0 == 55 && !$0.1 })
+    }
+
+    @Test func appSwitcherFallsBackToTabCycleWhenArrowDoesNotMoveHighlight() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherCycle.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var diagnostics: [String] = []
+        // 高亮标题始终不变：模拟“方向键不移动高亮”的系统。
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherHighlightedTitle: { "Safari" }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-cycle", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        let tabPressesAfterOpen = posted.filter { $0.0 == 48 && $0.1 }.count
+        press(.right)
+        // 第一次仍然先发方向键。
+        #expect(posted.contains { $0.0 == 124 && $0.1 })
+        // 核对后发现高亮没动：补一次 Tab 循环。
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming.appSwitcherArrowNavigationCheckMilliseconds
+        )
+        #expect(posted.filter { $0.0 == 48 && $0.1 }.count == tabPressesAfterOpen + 1)
+        #expect(diagnostics.contains { $0.contains("arrow_nav supported=false") })
+
+        // 判定之后方向键直接走 Tab 循环，不再发方向键。
+        posted.removeAll()
+        press(.right)
+        #expect(!posted.contains { $0.0 == 124 })
+        #expect(posted.contains { $0.0 == 48 && $0.1 })
+    }
+
+    @Test func appSwitcherKeepsArrowNavigationWhenHighlightMoves() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherArrowNav.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var diagnostics: [String] = []
+        var highlight = "Safari"
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherHighlightedTitle: { highlight }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-arrow-nav", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        let tabPressesAfterOpen = posted.filter { $0.0 == 48 && $0.1 }.count
+        press(.right)
+        #expect(posted.contains { $0.0 == 124 && $0.1 && $0.2.contains(.maskCommand) })
+        // 高亮确实移动了：不再补 Tab 循环。
+        highlight = "Chrome"
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming.appSwitcherArrowNavigationCheckMilliseconds
+        )
+        #expect(diagnostics.contains { $0.contains("arrow_nav supported=true") })
+        #expect(posted.filter { $0.0 == 48 && $0.1 }.count == tabPressesAfterOpen)
+    }
+
+    @Test func appSwitcherRetriesOpeningWhenSwitcherDidNotAppear() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherOpenRetry.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var diagnostics: [String] = []
+        // Dock 窗口数一直不变：切换器没有出现。
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherHudState: { .absent },
+            appSwitcherDockWindowCount: { 3 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-open-retry", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        let tabPressesAfterOpen = posted.filter { $0.0 == 48 && $0.1 }.count
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming.appSwitcherOpenVerificationMilliseconds
+        )
+        // 没打开就补发一次 Tab。
+        #expect(posted.filter { $0.0 == 48 && $0.1 }.count == tabPressesAfterOpen + 1)
+        #expect(diagnostics.contains { $0.contains("switcher_open retried=true") })
+    }
+
+    @Test func appSwitcherReopensSwitcherThatClosedByItself() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherReopen.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var diagnostics: [String] = []
+        // 切换器打开时 Dock 多一个窗口，随后又自己关掉了。
+        var dockWindows = 3
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherHudState: { .absent },
+            appSwitcherDockWindowCount: { dockWindows }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-reopen", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        let poll = HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds
+        let tabPressesAfterOpen = posted.filter { $0.0 == 48 && $0.1 }.count
+        // 切换器打开。
+        dockWindows = 4
+        scheduler.advance(toMilliseconds: poll * 2)
+        #expect(!diagnostics.contains { $0.contains("switcher_reopen") })
+        // 它又自己关掉了：补发一次 Tab 把它拉回来。
+        dockWindows = 3
+        scheduler.advance(toMilliseconds: poll * 4)
+        #expect(posted.filter { $0.0 == 48 && $0.1 }.count == tabPressesAfterOpen + 1)
+        #expect(diagnostics.contains { $0.contains("switcher_reopen attempt=1") })
+    }
+
+    @Test func appSwitcherKeepsSelectionWhenSwitcherClosesAfterNavigating() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherReopenGuard.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var diagnostics: [String] = []
+        var dockWindows = 3
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            windowCounter: { _ in 2 },
+            appSwitcherHudState: { .absent },
+            appSwitcherHighlightedTitle: { "Safari" },
+            appSwitcherDockWindowCount: { dockWindows }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-reopen-guard", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        let poll = HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds
+        dockWindows = 4
+        scheduler.advance(toMilliseconds: poll * 2)
+        // 用户已经用方向键选过东西（高亮标题固定不变，方向键核对会补一次循环）。
+        press(.right)
+        scheduler.advance(
+            toMilliseconds: poll * 2
+                + HIDRemoteTiming.appSwitcherArrowNavigationCheckMilliseconds
+        )
+        let tabPressesAfterNavigation = posted.filter { $0.0 == 48 && $0.1 }.count
+        // 切换器这时自己关掉了：不能再补 Tab，否则会冲掉用户选好的高亮。
+        dockWindows = 3
+        scheduler.advance(toMilliseconds: poll * 6)
+        #expect(posted.filter { $0.0 == 48 && $0.1 }.count == tabPressesAfterNavigation)
+        #expect(!diagnostics.contains { $0.contains("switcher_reopen") })
+    }
+
+    @Test func appSwitcherHeldDirectionRepeatsSelection() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherRepeat.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            // 固定 HUD 状态与 Dock 窗口数：本用例只关心连发与收尾汇总，
+            // 不该让 500ms 轮询去查真实辅助功能树。
+            appSwitcherHudState: { .absent },
+            appSwitcherDockWindowCount: { 3 }
+        )
+        monitor.connectSimulatedDevice(
+            fingerprint: "app-switcher-repeat", profileID: profileID
+        )
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1, data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        monitor.handleSimulatedReport(
+            reportID: 1, data: Data([UInt8(RemoteButton.left.hidUsage), 0, 0, 0, 0, 0])
+        )
+        #expect(posted.filter { $0.0 == 123 }.count == 2)
+
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.repeatStartMilliseconds)
+        #expect(posted.filter { $0.0 == 123 }.count == 4)
+
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.repeatStartMilliseconds + 100)
+        #expect(posted.filter { $0.0 == 123 }.count == 6)
+
+        monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.repeatStartMilliseconds + 500)
+        #expect(posted.filter { $0.0 == 123 }.count == 6)
+        // 连发只累加计数：会话期间不再逐次写日志，否则按住不放会一直刷。
+        #expect(!diagnostics.contains { $0.contains("phase=repeat") })
+
+        // 超时收尾那一行必须带着本会话的连发次数与方向，否则「按住移动了多少次」
+        // 这条信息就丢了。上面推进了两次，各触发一次连发。
+        let sessionEnd = HIDRemoteTiming.repeatStartMilliseconds + 500
+            + HIDRemoteTiming.appSwitcherTimeoutMilliseconds + 600
+        scheduler.advance(toMilliseconds: sessionEnd)
+        let ended = try #require(diagnostics.last { $0.contains("HID APP SWITCHER ended") })
+        #expect(ended.contains("reason=timeout"))
+        #expect(ended.contains("repeat_count=2"))
+        #expect(ended.contains("repeat_buttons=left:2"))
+    }
+
     @Test(arguments: [true, false])
     func appSwitcherRemoteControlsNavigateConfirmAndReportFinalFrontmostApp(isSeized: Bool) throws {
         let suiteName = "RemoteButtonsTests.appSwitcherControls.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -1543,6 +2586,7 @@ struct RemoteButtonsTests {
         var frontmost = PresetApplication.codex.bundleIdentifier
         var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
         var diagnostics: [String] = []
+        var restoreCalls: [(String?, String?)] = []
         let suppressor = KeyboardEventSuppressor()
         let monitor = HIDRemoteMonitor(
             settings: settings,
@@ -1556,6 +2600,10 @@ struct RemoteButtonsTests {
             appSwitcherKeyStatePoster: { code, isDown, flags in
                 posted.append((code, isDown, flags))
                 return true
+            },
+            minimizedWindowRestorer: { bundle, origin in
+                restoreCalls.append((bundle, origin))
+                return .skippedVisibleWindow
             }
         )
         monitor.connectSimulatedDevice(
@@ -1590,17 +2638,47 @@ struct RemoteButtonsTests {
         try press(.right)
         try press(.left)
         try press(.ok)
+        #expect(posted.count == 8)
+        #expect(posted.last?.0 == KeyboardInjector.leftOptionKeyCode)
+        #expect(posted.last?.1 == true)
+        scheduler.advance(
+            toMilliseconds: KeyboardInjector.AppSwitcherSession.optionHoldMilliseconds
+        )
+        #expect(posted.count == 9)
+        #expect(posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(posted.last?.1 == false)
+        #expect(posted.last?.2 == .maskAlternate)
+        scheduler.advance(
+            toMilliseconds: KeyboardInjector.AppSwitcherSession.optionHoldMilliseconds
+                + KeyboardInjector.AppSwitcherSession.optionReleaseMilliseconds
+        )
+        #expect(posted.count == 10)
+        #expect(posted.last?.0 == KeyboardInjector.leftOptionKeyCode)
+        #expect(posted.last?.2.isEmpty == true)
         frontmost = PresetApplication.safari.bundleIdentifier
         scheduler.advance(
-            toMilliseconds: HIDRemoteTiming.appSwitcherConfirmationProbeMilliseconds
+            toMilliseconds: HIDRemoteTiming.appSwitcherMinimizedRestoreProbeMilliseconds
         )
+
+        #expect(restoreCalls.count == 1)
+        #expect(restoreCalls.first?.0 == PresetApplication.safari.bundleIdentifier)
+        #expect(restoreCalls.first?.1 == PresetApplication.codex.bundleIdentifier)
+        #expect(diagnostics.contains { $0.contains("restore attempt=0") })
+        scheduler.advance(
+            toMilliseconds: HIDRemoteTiming.appSwitcherModifierWatchdogMilliseconds
+        )
+        #expect(!diagnostics.contains { $0.contains("watchdog") })
 
         #expect(posted.map { $0.0 } == [
             KeyboardInjector.leftCommandKeyCode, 48, 48,
             124, 124, 123, 123,
+            KeyboardInjector.leftOptionKeyCode,
             KeyboardInjector.leftCommandKeyCode,
+            KeyboardInjector.leftOptionKeyCode,
         ])
-        #expect(posted.map { $0.1 } == [true, true, false, true, false, true, false, false])
+        #expect(posted.map { $0.1 } == [
+            true, true, false, true, false, true, false, true, false, false,
+        ])
         #expect(diagnostics.contains { $0.contains("ended reason=confirmed confirmed=true") })
         #expect(diagnostics.contains {
             $0.contains("selection bundle_id=\(PresetApplication.safari.bundleIdentifier)")
@@ -1610,7 +2688,7 @@ struct RemoteButtonsTests {
 
     @Test func appSwitcherBackTimeoutAndFrontmostChangeReleaseCommand() throws {
         let suiteName = "RemoteButtonsTests.appSwitcherCancellation.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -1620,12 +2698,16 @@ struct RemoteButtonsTests {
         func runCancellation(
             advanceMilliseconds: UInt64? = nil,
             pressBack: Bool = false,
-            changeFrontmost: Bool = false
+            dismissExternally: Bool = false,
+            hudState: KeyboardInjector.AppSwitcherHudState = .visible(
+                selectedBundleIdentifier: PresetApplication.safari.bundleIdentifier
+            )
         ) -> (posted: [(CGKeyCode, Bool, CGEventFlags)], diagnostics: [String]) {
             let scheduler = RemoteButtonsTestScheduler()
             var frontmost = PresetApplication.codex.bundleIdentifier
             var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
             var diagnostics: [String] = []
+            var dismissHandler: (() -> Void)?
             let monitor = HIDRemoteMonitor(
                 settings: settings,
                 profileID: profileID,
@@ -1637,6 +2719,11 @@ struct RemoteButtonsTests {
                 appSwitcherKeyStatePoster: { code, isDown, flags in
                     posted.append((code, isDown, flags))
                     return true
+                },
+                appSwitcherHudState: { hudState },
+                appSwitcherDismissObserverInstaller: { handler in
+                    dismissHandler = handler
+                    return {}
                 }
             )
             monitor.connectSimulatedDevice(fingerprint: UUID().uuidString, profileID: profileID)
@@ -1649,7 +2736,7 @@ struct RemoteButtonsTests {
 
             press(.menu)
             if pressBack { press(.back) }
-            if changeFrontmost { frontmost = PresetApplication.safari.bundleIdentifier }
+            if dismissExternally { dismissHandler?() }
             if let advanceMilliseconds {
                 scheduler.advance(toMilliseconds: advanceMilliseconds)
             }
@@ -1659,6 +2746,9 @@ struct RemoteButtonsTests {
         let back = runCancellation(pressBack: true)
         #expect(back.posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
         #expect(back.posted.last?.1 == false)
+        // 取消必须在 Command 仍按住时先发 Escape：只松 Command 会被系统当成确认高亮 App。
+        let backTail = back.posted.suffix(3).map { $0.0 }
+        #expect(Array(backTail) == [53, 53, KeyboardInjector.leftCommandKeyCode])
         #expect(back.diagnostics.contains { $0.contains("ended reason=back") })
 
         let timeout = runCancellation(
@@ -1668,15 +2758,28 @@ struct RemoteButtonsTests {
         #expect(timeout.posted.last?.1 == false)
         #expect(timeout.diagnostics.contains { $0.contains("ended reason=timeout") })
 
-        let frontmostChanged = runCancellation(
-            advanceMilliseconds: HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds,
-            changeFrontmost: true
-        )
-        #expect(frontmostChanged.posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
-        #expect(frontmostChanged.posted.last?.1 == false)
-        #expect(frontmostChanged.diagnostics.contains {
-            $0.contains("ended reason=frontmost_changed")
+        // 用户在切换器外点了鼠标（切换器被系统关掉）：只释放 ⌘，不能补 Escape。
+        let dismissed = runCancellation(dismissExternally: true)
+        #expect(dismissed.posted.last?.0 == KeyboardInjector.leftCommandKeyCode)
+        #expect(dismissed.posted.last?.1 == false)
+        #expect(!dismissed.posted.contains { $0.0 == 53 })
+        #expect(dismissed.diagnostics.contains {
+            $0.contains("ended reason=mouse_click")
         })
+
+        // 辅助功能说 HUD 消失了：不结束会话（macOS 13 上这个信号不可靠）。
+        let hudAbsent = runCancellation(
+            advanceMilliseconds: HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds * 4,
+            hudState: .absent
+        )
+        #expect(!hudAbsent.diagnostics.contains { $0.contains("ended reason=") })
+        #expect(!hudAbsent.posted.contains { $0.0 == 55 && !$0.1 })
+
+        // HUD 还在：会话保持，⌘ 不释放。
+        let hudVisible = runCancellation(
+            advanceMilliseconds: HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds * 4
+        )
+        #expect(!hudVisible.diagnostics.contains { $0.contains("ended reason=hud_dismissed") })
     }
 
     @Test func customShortcutPostsRecordedCombinationAndSingleKeyAndRequiresAccessibility() {
@@ -1750,6 +2853,14 @@ struct RemoteButtonsTests {
             (.commandFind, 3, .maskCommand),
             (.commandSave, 1, .maskCommand),
             (.commandDelete, 51, .maskCommand),
+            (.commandMinimize, 46, .maskCommand),
+            (.toggleFullScreen, 3, [.maskControl, .maskCommand]),
+            (.commandNewTab, 17, .maskCommand),
+            (.commandPreviousTab, 33, [.maskShift, .maskCommand]),
+            (.commandNextTab, 30, [.maskShift, .maskCommand]),
+            (.commandNextWindow, 50, .maskCommand),
+            (.commandHide, 4, .maskCommand),
+            (.commandNew, 45, .maskCommand),
         ]
 
         for (action, keyCode, modifiers) in expected {
@@ -1772,6 +2883,80 @@ struct RemoteButtonsTests {
             ))
         }
         #expect(systemTypes == [16, 18, 17])
+    }
+
+    /// 调度中心等 WindowServer 符号快捷键不认箭头事件上的 flags，必须显式投递
+    /// Control 的按下/抬起边沿，并让箭头带 Fn + NumericPad（真实键盘恒带）。
+    /// 四个动作的序列必须是：Control down → arrow down → arrow up → Control up。
+    @Test func systemWindowGesturesPostControlEdgesAroundTheArrow() {
+        let expected: [(ButtonAction, CGKeyCode)] = [
+            (.missionControl, 126),
+            (.applicationWindows, 125),
+            (.spaceLeft, 123),
+            (.spaceRight, 124),
+        ]
+        let arrowFlags: CGEventFlags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+
+        for (action, arrow) in expected {
+            var events: [(CGKeyCode, Bool, CGEventFlags)] = []
+            #expect(KeyboardInjector.send(
+                action,
+                accessibilityTrusted: { true },
+                keyPoster: { _, _ in
+                    Issue.record("\(action) 不应走单键注入路径")
+                },
+                keyStatePoster: { code, isDown, flags in
+                    events.append((code, isDown, flags))
+                    return true
+                }
+            ))
+            #expect(events.map(\.0) == [59, arrow, arrow, 59])
+            #expect(events.map(\.1) == [true, true, false, false])
+            #expect(events[0].2 == .maskControl)
+            #expect(events[1].2 == arrowFlags)
+            #expect(events[2].2 == arrowFlags)
+            #expect(events[3].2 == [])
+        }
+    }
+
+    /// 锁屏与系统截屏同样是 WindowServer 符号快捷键，必须按真实键入顺序
+    /// 先按下全部修饰键、再按目标键、最后逆序抬起。
+    @Test func lockScreenAndScreenshotPostModifierEdgesInTypingOrder() {
+        var lockEvents: [(CGKeyCode, Bool, CGEventFlags)] = []
+        #expect(KeyboardInjector.send(
+            .lockScreen,
+            accessibilityTrusted: { true },
+            keyPoster: { _, _ in Issue.record("锁屏不应走单键注入路径") },
+            keyStatePoster: { code, isDown, flags in
+                lockEvents.append((code, isDown, flags))
+                return true
+            }
+        ))
+        #expect(lockEvents.map(\.0) == [59, 55, 12, 12, 55, 59])
+        #expect(lockEvents.map(\.1) == [true, true, true, false, false, false])
+        #expect(lockEvents[0].2 == .maskControl)
+        #expect(lockEvents[1].2 == [.maskControl, .maskCommand])
+        #expect(lockEvents[2].2 == [.maskControl, .maskCommand])
+        #expect(lockEvents[4].2 == .maskControl)
+        #expect(lockEvents[5].2 == [])
+
+        var shotEvents: [(CGKeyCode, Bool, CGEventFlags)] = []
+        #expect(KeyboardInjector.send(
+            .screenshot,
+            accessibilityTrusted: { true },
+            keyPoster: { _, _ in Issue.record("截屏不应走单键注入路径") },
+            keyStatePoster: { code, isDown, flags in
+                shotEvents.append((code, isDown, flags))
+                return true
+            }
+        ))
+        #expect(shotEvents.map(\.0) == [55, 56, 20, 20, 56, 55])
+        #expect(shotEvents.map(\.1) == [true, true, true, false, false, false])
+        #expect(shotEvents[0].2 == .maskCommand)
+        #expect(shotEvents[1].2 == [.maskCommand, .maskShift])
+        #expect(shotEvents[2].2 == [.maskCommand, .maskShift])
+        #expect(shotEvents[4].2 == .maskCommand)
+        #expect(shotEvents[5].2 == [])
     }
 
     @Test func phoneVoicePostsFunctionKeyDownAndUp() {
@@ -1851,6 +3036,7 @@ struct RemoteButtonsTests {
         #expect(KeyboardInjector.send(
             .openCustomApplication,
             applicationProfile: profile,
+            frontmostApplication: { nil },
             customApplicationURL: { _ in applicationURL },
             customApplicationOpener: { _, application, completion in
                 openedProfile = application
@@ -1970,12 +3156,68 @@ struct RemoteButtonsTests {
                 attemptedApplication = application
                 completion(nil, LaunchFailure())
             },
-            applicationFocuser: { _, _, _, _ in focusAttempted = true }
+            applicationFocuser: { _, _, _, _ in focusAttempted = true },
+            frontmostApplication: { nil }
         )
 
         #expect(handled)
         #expect(attemptedApplication == .codex)
         #expect(!focusAttempted)
+    }
+
+    @Test func alreadyFrontmostPresetApplicationSkipsReactivationAndFocusesRunningInstance() {
+        let applicationURL = URL(fileURLWithPath: "/Applications/WorkBuddy.app")
+        var openerCalled = false
+        var focusedURL: URL?
+        var focusedPID: pid_t?
+
+        let handled = KeyboardInjector.send(
+            .openWorkBuddy,
+            applicationURL: { _ in applicationURL },
+            applicationOpener: { _, _, completion in
+                openerCalled = true
+                completion(nil, nil)
+            },
+            applicationFocuser: { url, _, processIdentifier, _ in
+                focusedURL = url
+                focusedPID = processIdentifier
+            },
+            frontmostApplication: { (bundleIdentifier: PresetApplication.workBuddy.bundleIdentifier, processIdentifier: pid_t(4_244)) }
+        )
+
+        #expect(handled)
+        #expect(!openerCalled)
+        #expect(focusedURL == applicationURL)
+        #expect(focusedPID == 4_244)
+    }
+
+    @Test func alreadyFrontmostCustomApplicationSkipsReactivationAndFocusesRunningInstance() {
+        let profile = CustomApplicationProfile(
+            displayName: "Example Agent",
+            bundleIdentifier: "com.example.agent",
+            applicationPath: "/Applications/Example Agent.app",
+            focusStrategy: .recordedAccessibility,
+            accessibilityTarget: nil
+        )
+        let applicationURL = URL(fileURLWithPath: profile.applicationPath)
+        var openerCalled = false
+        var focusedPID: pid_t?
+
+        #expect(KeyboardInjector.send(
+            .openCustomApplication,
+            applicationProfile: profile,
+            frontmostApplication: { (bundleIdentifier: "com.example.agent", processIdentifier: pid_t(4_242)) },
+            customApplicationURL: { _ in applicationURL },
+            customApplicationOpener: { _, _, completion in
+                openerCalled = true
+                completion(nil, nil)
+            },
+            customApplicationFocuser: { _, processIdentifier, _ in
+                focusedPID = processIdentifier
+            }
+        ))
+        #expect(!openerCalled)
+        #expect(focusedPID == 4_242)
     }
 
     @Test func successfulComposerApplicationLaunchesPassURLApplicationAndPIDToFocuser() {
@@ -1999,7 +3241,8 @@ struct RemoteButtonsTests {
                     focusedURL = url
                     focusedApplication = application
                     focusedProcessIdentifier = processIdentifier
-                }
+                },
+                frontmostApplication: { nil }
             )
 
             #expect(handled)
@@ -2015,7 +3258,8 @@ struct RemoteButtonsTests {
             .openSafari,
             applicationURL: { _ in URL(fileURLWithPath: "/Applications/Safari.app") },
             applicationOpener: { _, _, completion in completion(123, nil) },
-            applicationFocuser: { _, _, _, _ in focusAttempted = true }
+            applicationFocuser: { _, _, _, _ in focusAttempted = true },
+            frontmostApplication: { nil }
         ))
         #expect(!focusAttempted)
     }
@@ -2308,6 +3552,28 @@ struct RemoteButtonsTests {
         ))
     }
 
+    @Test func composerCaretStoreRemembersOffsetsPerBundle() {
+        let store = ComposerCaretStore()
+        #expect(store.rememberedRange(forKey: "com.example.app") == nil)
+        store.remember(CFRange(location: 12, length: 0), forKey: "com.example.app")
+        let remembered = store.rememberedRange(forKey: "com.example.app")
+        #expect(remembered?.location == 12 && remembered?.length == 0)
+        // 非法偏移不记忆，避免恢复时制造越界写。
+        store.remember(CFRange(location: -1, length: 0), forKey: "com.example.other")
+        #expect(store.rememberedRange(forKey: "com.example.other") == nil)
+        // 同一 App 手动移动光标后覆盖旧记忆。
+        store.remember(CFRange(location: 30, length: 0), forKey: "com.example.app")
+        let updated = store.rememberedRange(forKey: "com.example.app")
+        #expect(updated?.location == 30 && updated?.length == 0)
+    }
+
+    @Test func composerCaretUsesTheStandardEndOfDocumentKey() {
+        // Cmd+Down 是 macOS 文本域“移到文档末尾”的标准键，空输入框下是天然无操作，
+        // 不依赖各宿主不可信的 AXNumberOfCharacters，也不写入选区。
+        #expect(KeyboardInjector.composerCaretEndKey.keyCode == 125)
+        #expect(KeyboardInjector.composerCaretEndKey.flags == .maskCommand)
+    }
+
     @Test func cmuxFocusRecoveryUsesCmuxOwnedForceFocusShortcuts() {
         let terminalFrame = CGRect(x: 300, y: 100, width: 600, height: 600)
         let textBoxFrame = CGRect(x: 320, y: 620, width: 560, height: 60)
@@ -2534,6 +3800,8 @@ struct RemoteButtonsTests {
             "reportRoutingDecision(",
             "needsEventLevelArm(",
             "routing.permissionsGranted",
+            // 方向键的提前登记必须走与主线程共用的判据，不能各自写一份。
+            "prearmsNativeEvent(",
         ] {
             #expect(prearmBody.contains(gate), "prearm is missing the \(gate) gate")
         }
@@ -2550,6 +3818,244 @@ struct RemoteButtonsTests {
         // 之后仍然收下陈旧记录，留下吞掉实体键盘音量键的窗口。
         let sessionGate = try #require(prearmBody.range(of: "prearmSession.perform("))
         #expect(sessionGate.lowerBound < prearmCall.lowerBound)
+    }
+
+    @Test func hidReportDeduplicationDropsOnlyTheSameReportWithinTheWindow() {
+        var cache = HIDReportDeduplicationCache()
+        let press = HIDReportDeduplicationKey(
+            devicePointer: 42,
+            reportID: 1,
+            data: Data([0x4A, 0, 0, 0, 0, 0])
+        )
+        let release = HIDReportDeduplicationKey(
+            devicePointer: 42,
+            reportID: 1,
+            data: Data(repeating: 0, count: 6)
+        )
+
+        let firstPress = cache.shouldDrop(key: press, timestampNanoseconds: 1_000_000_000)
+        #expect(!firstPress)
+        // manager 与 device 对同一份物理报告的到达时刻只差几毫秒。
+        let managerCopy = cache.shouldDrop(key: press, timestampNanoseconds: 1_010_000_000)
+        #expect(managerCopy)
+        // 同一按键的松开报告内容不同，不能被当成重复。
+        let releaseReport = cache.shouldDrop(key: release, timestampNanoseconds: 1_012_000_000)
+        #expect(!releaseReport)
+        // 超过去重窗口后，同一份报告必须重新处理。
+        let repeatedAfterWindow = cache.shouldDrop(key: press, timestampNanoseconds: 1_060_000_000)
+        #expect(!repeatedAfterWindow)
+    }
+
+    @Test func hidReportDeduplicationSeparatesDevicesAndReportIDs() {
+        var cache = HIDReportDeduplicationCache()
+        let first = HIDReportDeduplicationKey(
+            devicePointer: 1,
+            reportID: 1,
+            data: Data([0x4A, 0, 0, 0, 0, 0])
+        )
+        let secondDevice = HIDReportDeduplicationKey(
+            devicePointer: 2,
+            reportID: 1,
+            data: Data([0x4A, 0, 0, 0, 0, 0])
+        )
+        let secondReportID = HIDReportDeduplicationKey(
+            devicePointer: 1,
+            reportID: 2,
+            data: Data([0x4A, 0, 0, 0, 0, 0])
+        )
+
+        let firstDropped = cache.shouldDrop(key: first, timestampNanoseconds: 1_000_000_000)
+        let secondDeviceDropped = cache.shouldDrop(
+            key: secondDevice,
+            timestampNanoseconds: 1_005_000_000
+        )
+        let secondReportIDDropped = cache.shouldDrop(
+            key: secondReportID,
+            timestampNanoseconds: 1_010_000_000
+        )
+        #expect(!firstDropped)
+        #expect(!secondDeviceDropped)
+        #expect(!secondReportIDDropped)
+    }
+
+    @Test func hidReportDeduplicationBoundsRetainedEntries() {
+        var cache = HIDReportDeduplicationCache()
+        for index in 0 ..< 12 {
+            let key = HIDReportDeduplicationKey(
+                devicePointer: UInt(index),
+                reportID: 1,
+                data: Data([UInt8(index), 0, 0, 0, 0, 0])
+            )
+            let dropped = cache.shouldDrop(
+                key: key,
+                timestampNanoseconds: 1_000_000_000 + UInt64(index) * 1_000_000
+            )
+            #expect(!dropped)
+        }
+        #expect(cache.entries.count <= 8)
+    }
+
+    @Test func hidPathHealthUsesManagerFallbackWhenOwningDeviceCallbackIsSilent() {
+        var health = HIDReportPathHealth()
+        let firstWindowEvents = driveManagerOnlyWindow(&health, startingAt: 1_000_000_000)
+        #expect(firstWindowEvents.contains(.managerFallback))
+        let firstWindow = firstWindowEvents.compactMap { event -> HIDReportPathWindow? in
+            if case let .window(window) = event { return window }
+            return nil
+        }.first
+        #expect(firstWindow?.deviceReports == 0)
+        #expect((firstWindow?.managerReports ?? 0) > 0)
+        #expect((firstWindow?.fallbackReports ?? 0) > 0)
+        #expect(firstWindow?.deviceHealthy == false)
+        #expect(!firstWindowEvents.contains { event in
+            if case .recoveryCandidate = event { return true }
+            return false
+        })
+
+        let secondWindowEvents = driveManagerOnlyWindow(&health, startingAt: 11_000_000_000)
+        let candidates = secondWindowEvents.compactMap { event -> (Int, Int)? in
+            if case let .recoveryCandidate(attempt, managerReports) = event {
+                return (attempt, managerReports)
+            }
+            return nil
+        }
+        #expect(candidates.map { $0.0 } == [1])
+    }
+
+    @Test func hidPathHealthConfirmsDeviceDeliveryAndRecoversAfterManagerFallback() {
+        var health = HIDReportPathHealth()
+        let confirmed = health.record(
+            path: .device,
+            duplicate: false,
+            nowNanoseconds: 1_000_000_000,
+            recoveryEnabled: true
+        )
+        #expect(confirmed == [.deviceDeliveryConfirmed])
+
+        let recentManager = health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: 2_000_000_000,
+            recoveryEnabled: true
+        )
+        #expect(!recentManager.contains(.managerFallback))
+
+        let fallback = health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: 4_000_000_000,
+            recoveryEnabled: true
+        )
+        #expect(fallback.contains(.managerFallback))
+
+        let recovered = health.record(
+            path: .device,
+            duplicate: false,
+            nowNanoseconds: 4_500_000_000,
+            recoveryEnabled: true
+        )
+        #expect(recovered.contains(.deviceDeliveryRecovered))
+    }
+
+    @Test func hidPathHealthDoesNotCountDuplicateManagerReportsAsFallback() {
+        var health = HIDReportPathHealth()
+        _ = health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: 1_000_000_000,
+            recoveryEnabled: true
+        )
+        let duplicate = health.record(
+            path: .manager,
+            duplicate: true,
+            nowNanoseconds: 2_000_000_000,
+            recoveryEnabled: true
+        )
+        #expect(!duplicate.contains(.managerFallback))
+
+        let windowEvents = health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: 11_000_000_000,
+            recoveryEnabled: true
+        )
+        let window = windowEvents.compactMap { event -> HIDReportPathWindow? in
+            if case let .window(window) = event { return window }
+            return nil
+        }.first
+        #expect(window?.duplicateReports == 1)
+        #expect(window?.fallbackReports == 2)
+    }
+
+    @Test func hidPathHealthThrottlesAndBoundsDeviceCallbackRecovery() {
+        var health = HIDReportPathHealth()
+        var events = driveManagerOnlyWindow(&health, startingAt: 1_000_000_000)
+        events += driveManagerOnlyWindow(&health, startingAt: 11_000_000_000)
+
+        var start: UInt64 = 21_000_000_000
+        for _ in 0 ..< 6 {
+            events += driveManagerOnlyWindow(&health, startingAt: start)
+            start += 10_000_000_000
+        }
+        start = 81_000_000_000
+        for _ in 0 ..< 6 {
+            events += driveManagerOnlyWindow(&health, startingAt: start)
+            start += 10_000_000_000
+        }
+        start = 141_000_000_000
+        for _ in 0 ..< 6 {
+            events += driveManagerOnlyWindow(&health, startingAt: start)
+            start += 10_000_000_000
+        }
+
+        let attempts = events.compactMap { event -> Int? in
+            if case let .recoveryCandidate(attempt, _) = event { return attempt }
+            return nil
+        }
+        #expect(attempts == [1, 2, 3])
+        #expect(events.contains { event in
+            if case .recoveryExhausted = event { return true }
+            return false
+        })
+    }
+
+    @Test func hidMonitorNeverDropsManagerReportsSolelyBecauseDeviceCallbackExists() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/HIDRemoteMonitor.swift"),
+            encoding: .utf8
+        )
+        #expect(!source.contains("path == .device || !hasDeviceCallback"))
+        #expect(!source.contains("static func shouldAcceptReport("))
+        #expect(source.contains("pathHealth.record("))
+    }
+
+    private func driveManagerOnlyWindow(
+        _ health: inout HIDReportPathHealth,
+        startingAt start: UInt64
+    ) -> [HIDReportPathHealthEvent] {
+        var events = health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: start,
+            recoveryEnabled: true
+        )
+        events += health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: start + 5_000_000_000,
+            recoveryEnabled: true
+        )
+        events += health.record(
+            path: .manager,
+            duplicate: false,
+            nowNanoseconds: start + 10_000_000_000,
+            recoveryEnabled: true
+        )
+        return events
     }
 
     @Test func monitorStopEndsThePrearmSessionBeforeReleasingSharedResources() throws {
@@ -2708,7 +4214,7 @@ struct RemoteButtonsTests {
 
     @Test func savedBindingsMergeWithDefaults() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let saved = try JSONEncoder().encode([RemoteButton.back.rawValue: ButtonAction.disabled])
@@ -2721,7 +4227,7 @@ struct RemoteButtonsTests {
 
     @Test func legacyBindingsMigrateIntoFirstPhysicalRemoteProfile() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let legacyIdentifier = UUID()
         defaults.set(legacyIdentifier.uuidString, forKey: "peripheralIdentifier")
@@ -2739,7 +4245,7 @@ struct RemoteButtonsTests {
 
     @Test func physicalRemoteProfilesPersistIndependentMappingsAndBindings() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         let firstBluetoothID = UUID()
@@ -2785,10 +4291,11 @@ struct RemoteButtonsTests {
 
     @Test func additionalBluetoothRemoteCopiesCurrentMappingsBeforeIndependentEditing() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         let firstProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(firstProfileID, model: .rc003)
         settings.selectRemoteProfile(firstProfileID)
         let shortcut = CustomKeyboardShortcut(
             keyCode: 40,
@@ -2800,6 +4307,7 @@ struct RemoteButtonsTests {
         settings.setAction(.showDesktop, for: .tv, trigger: .doubleClick)
 
         let secondProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(secondProfileID, model: .rc003)
 
         #expect(settings.configuredAction(
             for: .menu,
@@ -2821,15 +4329,48 @@ struct RemoteButtonsTests {
         ).action == .customShortcut)
     }
 
+    @Test func anotherModelDoesNotInheritTheSelectedRemotesMappings() throws {
+        let suiteName = "RemoteMicTests.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        let rc003ProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(rc003ProfileID, model: .rc003)
+        settings.selectRemoteProfile(rc003ProfileID)
+        settings.setAction(.openCodex, for: .menu)
+        settings.setAction(.showDesktop, for: .tv, trigger: .doubleClick)
+
+        let rc001ProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        #expect(settings.configuredAction(
+            for: .menu,
+            trigger: .singleClick,
+            profileID: rc001ProfileID
+        ).action == AppSettings.defaultBindings[.menu])
+        settings.updateRemoteProfileModel(rc001ProfileID, model: .rc001)
+
+        #expect(settings.configuredAction(
+            for: .menu,
+            trigger: .singleClick,
+            profileID: rc001ProfileID
+        ).action == AppSettings.defaultBindings[.menu])
+        #expect(settings.configuredAction(
+            for: .tv,
+            trigger: .doubleClick,
+            profileID: rc001ProfileID
+        ).action == .disabled)
+    }
+
     @Test func HIDRemotesAreAutomaticallyAssignedAndKeepIndependentProfiles() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.setAction(.openCodex, for: .menu)
 
         let firstProfileID = settings.registerHIDRemote(fingerprint: "hid-one")
+        settings.updateRemoteProfileModel(firstProfileID, model: .rc003)
         let secondProfileID = settings.registerHIDRemote(fingerprint: "hid-two")
+        settings.updateRemoteProfileModel(secondProfileID, model: .rc003)
 
         #expect(firstProfileID != secondProfileID)
         #expect(settings.profileID(forHIDFingerprint: "hid-one") == firstProfileID)
@@ -2856,13 +4397,15 @@ struct RemoteButtonsTests {
             encoding: .utf8
         )
         #expect(source.contains("settings.registerHIDRemote(fingerprint: fingerprint)"))
-        #expect(source.contains("!self.macroFeature.isEditorActive && !suppressConfiguredAction"))
+        #expect(source.contains("!self.macroFeature.isEditorActive &&"))
+        #expect(source.contains("!suppressConfiguredAction &&"))
+        #expect(source.contains("!holdConfiguredActionForPendingIdentity"))
         #expect(!source.contains("pendingHIDBindingProfileID"))
     }
 
     @Test func unavailableContinuousRecordingExperimentDoesNotReplacePowerShortcut() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         let shortcut = CustomKeyboardShortcut(
@@ -2882,7 +4425,7 @@ struct RemoteButtonsTests {
 
     @Test func unavailableContinuousRecordingExperimentRestoresStalePowerBinding() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(true, forKey: "experimentalContinuousRecordingEnabled")
         defaults.set(
@@ -2916,7 +4459,7 @@ struct RemoteButtonsTests {
 
     @Test func importedContinuousRecordingExperimentIsDisabledAndRestoresBackup() throws {
         let sourceSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let sourceDefaults = try #require(UserDefaults(suiteName: sourceSuiteName))
+        let sourceDefaults = try #require(TestUserDefaults(suiteName: sourceSuiteName))
         defer { sourceDefaults.removePersistentDomain(forName: sourceSuiteName) }
         let source = AppSettings(defaults: sourceDefaults)
         let shortcut = CustomKeyboardShortcut(
@@ -2942,7 +4485,7 @@ struct RemoteButtonsTests {
         let exported = try JSONSerialization.data(withJSONObject: configuration)
 
         let targetSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let targetDefaults = try #require(UserDefaults(suiteName: targetSuiteName))
+        let targetDefaults = try #require(TestUserDefaults(suiteName: targetSuiteName))
         defer { targetDefaults.removePersistentDomain(forName: targetSuiteName) }
         let target = AppSettings(defaults: targetDefaults)
         try target.importConfiguration(from: exported)
@@ -2964,7 +4507,7 @@ struct RemoteButtonsTests {
 
     @Test func voiceFnTapModeExportsAndLegacyImportDisablesIt() throws {
         let sourceSuite = "RemoteMicTests.\(UUID().uuidString)"
-        let sourceDefaults = try #require(UserDefaults(suiteName: sourceSuite))
+        let sourceDefaults = try #require(TestUserDefaults(suiteName: sourceSuite))
         defer { sourceDefaults.removePersistentDomain(forName: sourceSuite) }
         let source = AppSettings(defaults: sourceDefaults)
         source.voiceFnTapModeEnabled = true
@@ -2975,7 +4518,7 @@ struct RemoteButtonsTests {
         #expect(object["voiceFnTapModeEnabled"] as? Bool == true)
 
         let targetSuite = "RemoteMicTests.\(UUID().uuidString)"
-        let targetDefaults = try #require(UserDefaults(suiteName: targetSuite))
+        let targetDefaults = try #require(TestUserDefaults(suiteName: targetSuite))
         defer { targetDefaults.removePersistentDomain(forName: targetSuite) }
         let target = AppSettings(defaults: targetDefaults)
         try target.importConfiguration(from: exported)
@@ -3013,7 +4556,7 @@ struct RemoteButtonsTests {
 
     @Test func trustedPhoneIdentitiesPersistDeduplicateAndClear() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let settings = AppSettings(defaults: defaults)
@@ -3032,7 +4575,7 @@ struct RemoteButtonsTests {
 
     @Test func updateAndLaunchPreferencesPersistAndImportCompatibly() throws {
         let sourceSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let sourceDefaults = try #require(UserDefaults(suiteName: sourceSuiteName))
+        let sourceDefaults = try #require(TestUserDefaults(suiteName: sourceSuiteName))
         defer { sourceDefaults.removePersistentDomain(forName: sourceSuiteName) }
         let sourceSettings = AppSettings(defaults: sourceDefaults)
         #expect(sourceSettings.openMainWindowAtLaunch)
@@ -3047,7 +4590,7 @@ struct RemoteButtonsTests {
 
         let exportedData = try sourceSettings.exportedConfigurationData()
         let targetSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let targetDefaults = try #require(UserDefaults(suiteName: targetSuiteName))
+        let targetDefaults = try #require(TestUserDefaults(suiteName: targetSuiteName))
         defer { targetDefaults.removePersistentDomain(forName: targetSuiteName) }
         let targetSettings = AppSettings(defaults: targetDefaults)
         try targetSettings.importConfiguration(from: exportedData)
@@ -3074,7 +4617,7 @@ struct RemoteButtonsTests {
 
     @Test func localUsageStatisticsSeparatesTodayWeekAndTotalAndPersists() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         var calendar = Calendar(identifier: .gregorian)
@@ -3153,7 +4696,7 @@ struct RemoteButtonsTests {
 
     @Test func legacyUsageTotalsRemainAvailableWithoutInventingDailyHistory() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(NSNumber(value: UInt64(42)), forKey: "usage.totalButtonPressCount")
         defaults.set(180.0, forKey: "usage.totalVoiceDuration")
@@ -3167,7 +4710,7 @@ struct RemoteButtonsTests {
 
     @Test func localVoiceSessionRankingKeepsTheLongestTenAndPersists() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let baseDate = Date(timeIntervalSince1970: 1_800_000_000)
 
@@ -3193,7 +4736,7 @@ struct RemoteButtonsTests {
 
     @Test func localUsageMetadataPersistsSourcesControlsHoursAndVoiceSessions() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         var calendar = Calendar(identifier: .gregorian)
@@ -3277,7 +4820,7 @@ struct RemoteButtonsTests {
 
     @Test func legacyUsageJSONLoadsWithoutFabricatingNewMetadata() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let recordID = UUID()
         let endedAt = Date(timeIntervalSinceReferenceDate: 800_000_000)
@@ -3320,7 +4863,7 @@ struct RemoteButtonsTests {
 
     @Test func weeklyUsageSeriesOnlyIncludesDatedHistory() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(NSNumber(value: UInt64(42)), forKey: "usage.totalButtonPressCount")
         defaults.set(180.0, forKey: "usage.totalVoiceDuration")
@@ -3392,7 +4935,7 @@ struct RemoteButtonsTests {
 
     @Test func completedUpdateDetectionCoversBuildIncreaseAndExistingInstallMigration() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
 
@@ -3410,7 +4953,7 @@ struct RemoteButtonsTests {
         ))
 
         let migrationSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let migrationDefaults = try #require(UserDefaults(suiteName: migrationSuiteName))
+        let migrationDefaults = try #require(TestUserDefaults(suiteName: migrationSuiteName))
         defer { migrationDefaults.removePersistentDomain(forName: migrationSuiteName) }
         #expect(AppSettings(defaults: migrationDefaults).recordLaunchAndDetectCompletedUpdate(
             currentBuild: "39",
@@ -3521,7 +5064,7 @@ struct RemoteButtonsTests {
 
     @Test func customShortcutsPersistAndResetWithBindings() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let shortcut = CustomKeyboardShortcut(
             keyCode: 8,
@@ -3544,7 +5087,7 @@ struct RemoteButtonsTests {
 
     @Test func customShortcutsSurviveSwitchingToOtherActionsAndBack() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let shortcut = CustomKeyboardShortcut(
             keyCode: 36,
@@ -3576,7 +5119,7 @@ struct RemoteButtonsTests {
 
     @Test func inactiveShortcutAndCustomApplicationConfigurationsSurviveSwitchesRestartAndImport() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let shortcut = CustomKeyboardShortcut(
             keyCode: 36,
@@ -3653,7 +5196,7 @@ struct RemoteButtonsTests {
         }
 
         let importedSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let importedDefaults = try #require(UserDefaults(suiteName: importedSuiteName))
+        let importedDefaults = try #require(TestUserDefaults(suiteName: importedSuiteName))
         defer { importedDefaults.removePersistentDomain(forName: importedSuiteName) }
         let imported = AppSettings(defaults: importedDefaults)
         try imported.importConfiguration(from: restored.exportedConfigurationData())
@@ -3685,7 +5228,7 @@ struct RemoteButtonsTests {
 
     @Test func customApplicationProfilesPersistPerRemoteAndRoundTripConfiguration() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let target = AccessibilityFocusTarget(
             role: "AXTextArea",
@@ -3725,7 +5268,7 @@ struct RemoteButtonsTests {
         ).applicationProfileID == profile.id)
 
         let importedSuiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let importedDefaults = try #require(UserDefaults(suiteName: importedSuiteName))
+        let importedDefaults = try #require(TestUserDefaults(suiteName: importedSuiteName))
         defer { importedDefaults.removePersistentDomain(forName: importedSuiteName) }
         let imported = AppSettings(defaults: importedDefaults)
         try imported.importConfiguration(from: restored.exportedConfigurationData())
@@ -3766,7 +5309,7 @@ struct RemoteButtonsTests {
 
     @Test func secondaryTriggerActionsPersistAndResetWithoutChangingSingleClick() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let shortcut = CustomKeyboardShortcut(
             keyCode: 9,
@@ -3802,7 +5345,7 @@ struct RemoteButtonsTests {
 
     @Test func migratesLegacyExclusiveToggleToCustomMappingToggle() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         defaults.set(true, forKey: "exclusiveHID")
@@ -3822,7 +5365,7 @@ struct RemoteButtonsTests {
         ]
         for (button, shortcut, profileOverride) in cases where !sayAllFrontmost || button == .back {
             let suite = "RemoteButtonsTests.finalRepeat.\(UUID().uuidString)"
-            let defaults = try #require(UserDefaults(suiteName: suite))
+            let defaults = try #require(TestUserDefaults(suiteName: suite))
             defer { defaults.removePersistentDomain(forName: suite) }
             let settings = AppSettings(defaults: defaults)
             settings.customMappingEnabled = true
@@ -3875,7 +5418,7 @@ struct RemoteButtonsTests {
         let inherited = variant & 2 != 0
         let command = variant & 4 != 0
         let suite = "RemoteButtonsTests.rapidProfile.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -3936,7 +5479,7 @@ struct RemoteButtonsTests {
     @Test(arguments: RemoteButton.xiaomiCases.filter { $0.nativeEvent != nil }, [true, false])
     func profileShortcutSuppressesNativeEvent(button: RemoteButton, seized: Bool) throws {
         let suiteName = "RemoteButtonsTests.profileNative.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -4007,7 +5550,7 @@ struct RemoteButtonsTests {
     @Test(arguments: [RemoteButton.left, .right], [true, false])
     func profileSingleClickOwnsMonitoredArrow(button: RemoteButton, unified: Bool) throws {
         let suiteName = "RemoteButtonsTests.profileArrow.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -4092,7 +5635,7 @@ struct RemoteButtonsTests {
     @Test(arguments: [RemoteButton.left, .right], [true, false])
     func discoveredProfileSingleClickRepeatsFinalAction(button: RemoteButton, unified: Bool) throws {
         let suiteName = "RemoteButtonsTests.discoveryArrow.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -4159,7 +5702,7 @@ struct RemoteButtonsTests {
     @Test(arguments: [RemoteButton.left, .right])
     func unrelatedProfileBindingKeepsMonitoredArrowNative(button: RemoteButton) throws {
         let suiteName = "RemoteButtonsTests.unboundArrow.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -4196,7 +5739,7 @@ struct RemoteButtonsTests {
     @Test(arguments: [RemoteButton.left, .right], [ButtonAction.customShortcut, .disabled])
     func explicitArrowShortcutOrDisabledNeverInherits(button: RemoteButton, action: ButtonAction) throws {
         let suiteName = "RemoteButtonsTests.explicitArrow.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -4233,7 +5776,7 @@ struct RemoteButtonsTests {
 
     @Test func disabledMappingBackIgnoresStoredMappingsOverridesAndOtherButtons() throws {
         let suiteName = "RemoteButtonsTests.backOnly.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = false
@@ -4306,7 +5849,7 @@ struct RemoteButtonsTests {
 
     @Test func seizedTVConfiguredActionSuppressesNativePunctuationEvent() throws {
         let suiteName = "RemoteButtonsTests.tvSeizedSuppression.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -4423,6 +5966,131 @@ struct RemoteButtonsTests {
         #expect(RemotePowerState.externalPower.logValue == "external_power")
         #expect(RemotePowerState.charging.logValue == "charging")
         #expect(RemotePowerState.unknown.logValue == "unknown")
+    }
+
+    @Test(arguments: [ButtonAction.returnKey, .combinationAction])
+    func actionFailureKeepsMonitorAliveAndNextPressAccepted(_ action: ButtonAction) throws {
+        let suiteName = "RemoteButtonsTests.actionFailure.\(action.rawValue).\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(action, for: .ok)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let suppressor = KeyboardEventSuppressor()
+        suppressor.setPrearmActiveForTesting(true)
+        var attempts = 0
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            eventSuppressor: suppressor,
+            ownsEventSuppressor: true,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in
+                attempts += 1
+                return attempts > 1
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) }
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "action-failure-\(action.rawValue)",
+            profileID: profileID
+        ))
+        let press = Data([UInt8(RemoteButton.ok.hidUsage), 0, 0, 0, 0, 0])
+        let release = Data(repeating: 0, count: press.count)
+
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        monitor.handleSimulatedReport(reportID: 1, data: release)
+
+        #expect(attempts == 1)
+        #expect(suppressor.acceptsPrearm)
+        #expect(!monitor.status.key.contains("accessibility_expired"))
+        #expect(diagnostics.contains {
+            $0.contains("HID ACTION failed") && $0.contains("monitor_retained=true")
+        })
+
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        monitor.handleSimulatedReport(reportID: 1, data: release)
+        #expect(attempts == 2)
+    }
+
+    @Test func backOnlyFailureDoesNotReleasePermissionsOrStopTheMonitor() throws {
+        let suiteName = "RemoteButtonsTests.backOnlyFailure.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        let suppressor = KeyboardEventSuppressor()
+        suppressor.setPrearmActiveForTesting(true)
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            eventSuppressor: suppressor,
+            ownsEventSuppressor: true,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in false },
+            diagnosticLogger: { diagnostics.append($0) }
+        )
+
+        monitor.handleSimulatedBackOnlyReport(
+            reportID: 1,
+            data: Data([UInt8(RemoteButton.back.hidUsage), 0, 0, 0, 0, 0])
+        )
+
+        #expect(suppressor.acceptsPrearm)
+        #expect(!monitor.status.key.contains("system_expired"))
+        #expect(diagnostics.contains {
+            $0.contains("HID ACTION failed") &&
+                $0.contains("path=back_only") &&
+                $0.contains("monitor_retained=true")
+        })
+    }
+
+    @Test func repeatFailureCancelsRepeatWithoutStoppingTheMonitor() throws {
+        let suiteName = "RemoteButtonsTests.repeatFailure.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.scrollUp, for: .up)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        let suppressor = KeyboardEventSuppressor()
+        suppressor.setPrearmActiveForTesting(true)
+        var attempts = 0
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            eventSuppressor: suppressor,
+            ownsEventSuppressor: true,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in
+                attempts += 1
+                return attempts == 1
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) }
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "repeat-failure",
+            profileID: profileID
+        ))
+        monitor.handleSimulatedReport(
+            reportID: 1,
+            data: Data([UInt8(RemoteButton.up.hidUsage), 0, 0, 0, 0, 0])
+        )
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.repeatStartMilliseconds)
+
+        #expect(attempts == 2)
+        #expect(suppressor.acceptsPrearm)
+        #expect(!monitor.status.key.contains("accessibility_expired"))
+        #expect(diagnostics.contains {
+            $0.contains("HID ACTION failed") &&
+                $0.contains("monitor_retained=true")
+        })
     }
 }
 

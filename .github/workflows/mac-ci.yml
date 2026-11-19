@@ -26,6 +26,7 @@ jobs:
       product_change: ${{ steps.changes.outputs.product_change }}
       tooling_only: ${{ steps.changes.outputs.tooling_only }}
       repository_only: ${{ steps.changes.outputs.repository_only }}
+      release_metadata_only: ${{ steps.changes.outputs.release_metadata_only }}
       release_checks: ${{ steps.changes.outputs.release_checks }}
     steps:
       - name: Check out repository
@@ -65,7 +66,7 @@ jobs:
   public_test:
     name: Public Swift tests and dual-architecture build
     needs: classify_changes
-    runs-on: ${{ (needs.classify_changes.outputs.product_change == 'true' || needs.classify_changes.outputs.release_checks == 'true') && 'xcode-27' || 'ubuntu-latest' }}
+    runs-on: ${{ (needs.classify_changes.outputs.product_change == 'true' || (needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true')) && 'xcode-27' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
@@ -74,6 +75,10 @@ jobs:
       RELEASE_VARIANT: intel
       SAYALL_AI_PACKAGE_PATH: ""
       SAYALL_PRIVATE_PLATFORM_MODE: public
+      SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH: ""
+      SAYALL_CHROMECAST_PACKAGE_PATH: ""
+      SAYALL_ENABLE_CHROMECAST: "0"
+      SAYALL_ENABLE_BUTTON_PROFILES: "0"
       SAYALL_ENABLE_PRIVATE_SWIFTPM: "0"
       SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH: ""
       SAYALL_COMBINATION_ACTIONS_PATH: ""
@@ -87,6 +92,10 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+
+      - name: Ensure macOS CI tools
+        if: needs.classify_changes.outputs.product_change == 'true' || (needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true')
+        run: command -v rg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
 
       - name: Check patch formatting
         run: |
@@ -105,6 +114,12 @@ jobs:
             test -f "$file"
           done
           echo "Documentation-only change passed."
+
+      - name: Run release metadata checks
+        if: needs.classify_changes.outputs.release_metadata_only == 'true'
+        env:
+          RELEASE_METADATA_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: ./scripts/verify-release-metadata.sh
 
       - name: Run tooling checks
         if: needs.classify_changes.outputs.tooling_only == 'true'
@@ -135,8 +150,30 @@ jobs:
         run: swift --version
 
       - name: Verify release configuration
-        if: needs.classify_changes.outputs.release_checks == 'true'
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
         run: ./scripts/verify-release-dependency-pins.sh tokens
+
+      - name: Run release control-plane fixture
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
+        run: |
+          command -v rg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
+          ./scripts/test-macos-release-flow.sh
+
+      - name: Verify private Draft asset staging
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
+        run: ./scripts/test-prepare-private-draft-assets.sh
+
+      - name: Verify release baseline gate
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
+        run: ./scripts/test-verify-release-baseline.sh
+
+      - name: Verify release asset source check
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
+        run: ./scripts/test-verify-release-asset-source.sh
+
+      - name: Verify release notes rendering
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
+        run: ./scripts/test-render-private-draft-notes.sh
 
       - name: Run Swift tests
         if: needs.classify_changes.outputs.product_change == 'true'
@@ -148,17 +185,18 @@ jobs:
           swift test --disable-keychain --filter VoiceInputDestinationCoordinatorTests
           swift test --disable-keychain --filter CoreVoiceInputJourneyTests
 
-      - name: Run release control-plane fixture
-        if: needs.classify_changes.outputs.release_checks == 'true'
+      - name: Run release build-signing tests
+        if: needs.classify_changes.outputs.release_checks == 'true' && needs.classify_changes.outputs.release_metadata_only != 'true'
         env:
           PRODUCT_CHANGE: ${{ needs.classify_changes.outputs.product_change }}
+        # The complete shell fixture already passed before Swift compilation.
         # Product changes reuse the test binary; control-only changes compile once.
         run: |
           command -v rg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
           if [[ "$PRODUCT_CHANGE" == true ]]; then
-            swift test --disable-keychain --skip-build --filter BuildSigningTests
+            swift test --disable-keychain --skip-build --filter BuildSigningTests --skip releaseControlPlaneFixtureHasExecutableRegressionCoverage
           else
-            swift test --disable-keychain --filter BuildSigningTests
+            swift test --disable-keychain --filter BuildSigningTests --skip releaseControlPlaneFixtureHasExecutableRegressionCoverage
           fi
 
       - name: Run project self-test
@@ -176,6 +214,37 @@ jobs:
         env:
           RELEASE_VARIANT: intel
         run: swift build --disable-keychain -c release --triple x86_64-apple-macosx13.0
+
+      - name: Build the default public App
+        if: needs.classify_changes.outputs.product_change == 'true'
+        env:
+          RELEASE_VARIANT: apple-silicon
+          REMOTE_MIC_BUILD_SCRATCH_PATH: ${{ github.workspace }}/.build
+          SAYALL_LOCAL_APP_TARGET: ${{ runner.temp }}/sayall-public/SayAll.app
+          SAYALL_LOCAL_DEFER_LAUNCH: "1"
+        run: |
+          env -u SAYALL_PRIVATE_PLATFORM_MODE ./scripts/package-local-test-app.sh
+          ./scripts/verify-app.sh "$SAYALL_LOCAL_APP_TARGET"
+          test "$(plutil -extract SayAllPrivateArtifactsIncluded raw -o - "$SAYALL_LOCAL_APP_TARGET/Contents/Info.plist")" = false
+          test "$(plutil -extract SayAllBuildChannel raw -o - "$SAYALL_LOCAL_APP_TARGET/Contents/Info.plist")" = public
+
+      - name: Launch the packaged public App
+        if: needs.classify_changes.outputs.product_change == 'true'
+        env:
+          PUBLIC_APP: ${{ runner.temp }}/sayall-public/SayAll.app
+        run: |
+          open -n "$PUBLIC_APP"
+          app_pid=""
+          for _ in {1..20}; do
+            app_pid="$(pgrep -fx "$PUBLIC_APP/Contents/MacOS/RemoteMic" || true)"
+            [[ -z "$app_pid" ]] || break
+            sleep 0.5
+          done
+          test -n "$app_pid"
+          trap 'kill -TERM "$app_pid" 2>/dev/null || true' EXIT
+          sleep 2
+          kill -0 "$app_pid"
+          echo 'PUBLIC APP STARTUP result=passed'
 
   test:
     name: Swift tests and build (${{ matrix.label }})

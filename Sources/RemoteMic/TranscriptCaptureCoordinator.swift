@@ -51,6 +51,9 @@ struct TranscriptCaptureSnapshot: Equatable {
 
     static func system() -> TranscriptCaptureSnapshot? {
         guard AXIsProcessTrusted() else { return nil }
+        // 自己是前台时不做 AX：同进程查询会进 SwiftUI view graph（#678 同类），
+        // 语义上也不该把自家设置窗口当成转录目标。
+        guard !AXSelfTargetPolicy.isOwnFrontmostApplication() else { return nil }
         let systemWideElement = AXUIElementCreateSystemWide()
         guard let focusedElement = axElement(
             systemWideElement,
@@ -59,6 +62,7 @@ struct TranscriptCaptureSnapshot: Equatable {
 
         var processIdentifier: pid_t = 0
         guard AXUIElementGetPid(focusedElement, &processIdentifier) == .success,
+              !AXSelfTargetPolicy.isOwnProcess(processIdentifier),
               let application = NSRunningApplication(processIdentifier: processIdentifier),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
               let text = axString(focusedElement, attribute: kAXValueAttribute as CFString),
@@ -460,7 +464,7 @@ final class TranscriptCaptureCoordinator {
             complete(session, reason: "destination_cleared")
             return
         } else {
-            cancel(reason: "discontinuous_text_change")
+            completeAcceptedChangeOrCancel(session, reason: "discontinuous_after_finish")
             return
         }
 

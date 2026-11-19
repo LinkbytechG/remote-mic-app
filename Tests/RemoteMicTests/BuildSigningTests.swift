@@ -6,6 +6,90 @@ import Testing
 
 @Suite("Build signing")
 struct BuildSigningTests {
+    @Test(arguments: ["published", "local", "mismatch", "invalid_local"])
+    func localPackageChecksTheSelectedPrivateCommit(mode: String) throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("scripts/package-local-test-app.sh"), encoding: .utf8)
+        let start = try #require(source.range(of: "platform_version="))
+        let end = try #require(source.range(of: "\n    ;;\n  *)", range: start.upperBound..<source.endIndex))
+        let preflight = source[start.lowerBound..<end.lowerBound]
+        let harness = """
+        set -euo pipefail
+        ROOT=/fixture/host
+        SAYALL_PRIVATE_SOURCE_ROOT=/fixture/private
+        SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH=/fixture/artifacts
+        SAYALL_LOCAL_PRIVATE_SOURCE_COMMIT='\(mode == "local" || mode == "invalid_local" ? "candidate" : "")'
+        jq() {
+          if [[ "$2" == '.sourceCommit' ]]; then
+            print '\(mode == "local" ? "candidate" : mode == "mismatch" ? "other" : "published")'
+          else
+            print '2.9.0'
+          fi
+        }
+        git() { print published; }
+        python3() {
+          [[ "$*" == *'--channel local --local-commit candidate' ]] || return 17
+          print checked_local
+          return \(mode == "invalid_local" ? 1 : 0)
+        }
+        \(preflight)
+        print accepted
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", harness]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        #expect((process.terminationStatus == 0) == (mode == "published" || mode == "local"))
+        #expect(output.contains("accepted") == (process.terminationStatus == 0))
+        #expect(output.contains("checked_local") == (mode == "local" || mode == "invalid_local"))
+    }
+
+    @Test(arguments: ["public", "default", "private_input", "required_missing", "public_private", "invalid"])
+    func localPackageSelectsPublicOrRequiredBeforeBuilding(mode: String) throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("scripts/package-local-test-app.sh"), encoding: .utf8)
+        let start = try #require(source.range(of: "private_inputs=false"))
+        let end = try #require(source.range(of: "zmodload zsh/system"))
+        let preflight = source[start.lowerBound..<end.lowerBound]
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", "set -euo pipefail\n" + preflight + "\nprint selected=$local_mode"]
+        var environment = ProcessInfo.processInfo.environment.filter {
+            !$0.key.hasPrefix("SAYALL_") && $0.key != "CODE_SIGN_IDENTITY"
+        }
+        switch mode {
+        case "public", "public_private": environment["SAYALL_PRIVATE_PLATFORM_MODE"] = "public"
+        case "required_missing": environment["SAYALL_PRIVATE_PLATFORM_MODE"] = "required"
+        case "invalid": environment["SAYALL_PRIVATE_PLATFORM_MODE"] = "auto"
+        default: break
+        }
+        if mode == "private_input" || mode == "public_private" {
+            environment["SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH"] = "/fixture/artifacts"
+        }
+        process.environment = environment
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        let isPublic = mode == "public" || mode == "default"
+        #expect((process.terminationStatus == 0) == isPublic)
+        #expect(output.contains("selected=public") == isPublic)
+        if mode == "private_input" || mode == "required_missing" {
+            #expect(output.contains("Set the private platform source root"))
+        }
+        if mode == "public_private" {
+            #expect(output.contains("Public local builds exclude private inputs"))
+        }
+    }
+
     @Test func membershipServiceEnvironmentStaysBehindOptionalAdapter() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -169,7 +253,7 @@ struct BuildSigningTests {
         #expect(source.contains(scanPattern))
         #expect(source.contains(publicPathPattern))
         #expect(source.contains("rg -a -o --no-filename"))
-        #expect(source.contains("| rg -v '"))
+        #expect(source.contains("| rg -v \"$PUBLIC_SENTRY_PATH_PATTERN\""))
         #expect(!source.contains("| rg -q -v"))
         let scan = try NSRegularExpression(pattern: scanPattern)
         let publicPath = try NSRegularExpression(pattern: publicPathPattern)
@@ -380,8 +464,9 @@ struct BuildSigningTests {
         #expect(buildSource.contains("REQUIRE_SAYALL_MAC_REMOTE_PACKAGE"))
         #expect(buildSource.contains("A SayAll Mac remote package is required for this build"))
         #expect(workflowSource.contains(
-            "SAYALL_MAC_REMOTE_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform/packages/macos-remote"
+            "SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH=$PRIVATE_ARTIFACT_PACKAGE"
         ))
+        #expect(!workflowSource.contains(".private-dependencies/sayall-private-platform"))
         #expect(workflowSource.contains("REQUIRE_SAYALL_MAC_REMOTE_PACKAGE=1"))
     }
 
@@ -419,6 +504,35 @@ struct BuildSigningTests {
         #expect(notarizeSource.contains("run_release_stage app-verify-pre-notary"))
         #expect(verifySource.contains("Developer ID app is missing a production Web Remote relay URL"))
         #expect(verifySource.contains("Protected release App must declare SayAllBuildChannel=release"))
+    }
+
+    @Test func privateDraftDefaultsToAppleSiliconAndSkipsUninstallerNotarization() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let notarizeSource = try String(
+            contentsOf: root.appendingPathComponent("scripts/notarize-release.sh"),
+            encoding: .utf8
+        )
+        let prepareSource = try String(
+            contentsOf: root.appendingPathComponent("scripts/prepare-private-draft-assets.sh"),
+            encoding: .utf8
+        )
+        let releasingSource = try String(
+            contentsOf: root.appendingPathComponent("RELEASING.md"),
+            encoding: .utf8
+        )
+
+        #expect(notarizeSource.contains("--private-draft"))
+        #expect(notarizeSource.contains("--include-intel"))
+        #expect(notarizeSource.contains("run_variants=(apple-silicon)"))
+        #expect(notarizeSource.contains("PRIVATE_DRAFT_SKIP_UNINSTALLER_NOTARIZATION"))
+        #expect(notarizeSource.contains("PRIVATE DRAFT: skipped uninstaller notarization and stapling"))
+        #expect(notarizeSource.contains("Sparkle update generation requires both Apple Silicon and Intel variants"))
+        #expect(prepareSource.contains("defaults to Apple Silicon only"))
+        #expect(releasingSource.contains("--private-draft"))
+        #expect(releasingSource.contains("Apple Silicon 快速包"))
     }
 
     @Test func productionReleaseAIIsOptInAndVerifiedWhenRequired() throws {
@@ -579,6 +693,13 @@ struct BuildSigningTests {
                     return define["_0"] as? String
                 }
                 #expect(defines.contains("SAYALL_UNIFIED_BUTTON_CONFIGURATION") == includesArtifacts)
+                for hardwareFlag in [
+                    "SAYALL_SIRI_REMOTE_ENABLED",
+                    "SAYALL_CHROMECAST_ENABLED",
+                    "SAYALL_MAC_REMOTE_ENABLED",
+                ] {
+                    #expect(defines.contains(hardwareFlag) == includesArtifacts)
+                }
             }
         }
     }
@@ -711,7 +832,12 @@ struct BuildSigningTests {
         #expect(publicationWorkflow.contains("ref: ${{ github.sha }}"))
         #expect(publicationWorkflow.contains("TRIGGER_REPOSITORY"))
         #expect(publicationWorkflow.contains("github.ref_name == 'main'"))
-        #expect(!publicationWorkflow.contains("secrets."))
+        let publicationWithoutFeedToken = publicationWorkflow.replacingOccurrences(
+            of: "secrets.SAYALL_FEED_SYNC_TOKEN", with: "feed_sync_credential"
+        )
+        #expect(!publicationWithoutFeedToken.contains("secrets."))
+        #expect(publicationWorkflow.contains("sync-update-feeds.mjs --preflight"))
+        #expect(publicationWorkflow.contains("Synchronize and verify all original update feed URLs"))
         #expect(!publicationWorkflow.contains("environment: mac-release"))
         #expect(stableWorkflow.contains("promote-preview-release.sh"))
         #expect(stableWorkflow.contains("environment: mac-stable-release"))
@@ -1158,17 +1284,26 @@ struct BuildSigningTests {
             contentsOf: root.appendingPathComponent("scripts/prepare-public-release-assets.sh"),
             encoding: .utf8
         )
-        #expect(assetSource.contains("published_prefix=\"SayAll-$version-$build\""))
-        #expect(assetSource.contains("$published_prefix.zh.txt"))
-        #expect(assetSource.contains("$published_prefix.en.txt"))
+        let contract = try #require(JSONSerialization.jsonObject(
+            with: Data(contentsOf: root.appendingPathComponent("config/release-assets.json"))
+        ) as? [String: Any])
+        let manifests = try #require(contract["manifests"] as? [String: [[String: String]]])
+        let currentAssets = try #require(manifests["2"])
+        #expect(Set(currentAssets.compactMap { $0["name"] }) == Set([
+            "SayAll-{version}-{build}.zip", "SayAll-{version}-{build}-Intel.zip",
+            "SayAll-{version}-{build}.zh.txt", "SayAll-{version}-{build}.en.txt",
+            "SayAll-{version}-{build}-AppleSilicon-install.pkg",
+            "SayAll-{version}-{build}-Intel-install.pkg",
+            "SayAll-{version}-{build}-AppleSilicon-uninstall.pkg",
+            "SayAll-{version}-{build}-Intel-uninstall.pkg",
+            "appcast.xml", "appcast-intel.xml",
+        ]))
+        #expect(manifests["1"]?.count == 13)
+        #expect(assetSource.contains("release-assets.py\" copies"))
         #expect(assetSource.contains("production_prefix"))
         #expect(assetSource.contains("staged-assets.json"))
         #expect(assetSource.contains("verify-staged-release-assets.sh"))
-        #expect(assetSource.contains("ASSET_COUNT: 10"))
-        #expect(assetSource.contains("$published_prefix-AppleSilicon-install.pkg"))
-        #expect(assetSource.contains("$published_prefix-Intel-install.pkg"))
-        #expect(assetSource.contains("$published_prefix-AppleSilicon-uninstall.pkg"))
-        #expect(assetSource.contains("$published_prefix-Intel-uninstall.pkg"))
+        #expect(assetSource.contains("ASSET_COUNT: $asset_count"))
         #expect(!assetSource.contains("candidate-provenance.json"))
     }
 
@@ -1193,15 +1328,14 @@ struct BuildSigningTests {
         #expect(workflowSource.contains("RELEASE_CREDENTIALS_DEPLOY_KEY"))
         #expect(workflowSource.contains("APPLE_SIGNING_MATCH_DEPLOY_KEY"))
         #expect(workflowSource.contains("RELEASE_AGE_IDENTITY"))
-        #expect(workflowSource.contains(
-            "steps.release-dependencies.outputs.sayall_private_platform_repository"
-        ))
+        #expect(workflowSource.contains("SAYALL_PRIVATE_RELEASE_READ_TOKEN"))
         #expect(workflowSource.contains(
             "steps.release-dependencies.outputs.sayall_private_platform_version"
         ))
         #expect(!workflowSource.contains("SAYALL_MAC_REMOTE_DEPLOY_KEY"))
         #expect(!workflowSource.contains("steps.release-dependencies.outputs.sayall_mac_remote_commit"))
-        #expect(workflowSource.contains("SAYALL_MAC_REMOTE_PACKAGE_PATH"))
+        #expect(workflowSource.contains("REQUIRE_SAYALL_MAC_REMOTE_PACKAGE=1"))
+        #expect(!workflowSource.contains("build-private-xcframeworks.sh"))
         #expect(workflowSource.contains("HD838A/remotemic-notary-secrets"))
         #expect(workflowSource.contains("HD838A/apple-signing-match"))
         #expect(workflowSource.contains("package-macos-release-in-actions.sh"))

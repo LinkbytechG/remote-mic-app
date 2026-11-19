@@ -4,9 +4,43 @@ import Testing
 
 @Suite("Apple Remote explicit activation")
 struct SiriRemoteActivationTests {
+    @Test func installedHelperReplacesMissingInstallerReceipt() {
+        #expect(!SiriRemoteActivationPolicy.needsActivation(
+            enabled: true,
+            needsUserAction: false,
+            audioStatus: "ready",
+            installerReceiptPresent: false,
+            helperInstalled: true
+        ))
+        #expect(SiriRemoteActivationPolicy.needsActivation(
+            enabled: true,
+            needsUserAction: false,
+            audioStatus: "ready",
+            installerReceiptPresent: false,
+            helperInstalled: false
+        ))
+    }
+
+    @Test func activationStillSurfacesRetryAndUnavailableStates() {
+        #expect(SiriRemoteActivationPolicy.needsActivation(
+            enabled: true,
+            needsUserAction: true,
+            audioStatus: "ready",
+            installerReceiptPresent: true,
+            helperInstalled: true
+        ))
+        #expect(SiriRemoteActivationPolicy.needsActivation(
+            enabled: true,
+            needsUserAction: false,
+            audioStatus: "unavailable:authorization_helper_upgrade_denied",
+            installerReceiptPresent: true,
+            helperInstalled: true
+        ))
+    }
+
     @Test @MainActor func discoveryAndOldOnboardingSelectionDoNotEnableServices() throws {
         let suite = "SiriActivation.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         #expect(!settings.siriRemoteEnabled)
@@ -17,16 +51,20 @@ struct SiriRemoteActivationTests {
         #expect(!AppSettings(defaults: defaults).siriRemoteEnabled)
     }
 
-    @Test @MainActor func explicitEnableAndDisableSurviveRelaunch() throws {
+    @Test @MainActor func explicitEnableWithoutMembershipSurvivesRelaunch() throws {
         let suite = "SiriActivation.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(false, forKey: "siriRemote.enabled")
         let settings = AppSettings(defaults: defaults)
         #expect(!settings.siriRemoteEnabled)
-        let model = BridgeAppModel(settings: settings)
+        let membership = MembershipFeatureIntegration(configuration: nil)
+        #expect(membership.buttonProfilesAccessDecision == .unavailable)
+        #expect(!membership.canUseSiriRemoteVoice)
+        let model = BridgeAppModel(settings: settings, membershipFeature: membership)
         model.setSiriRemoteEnabled(true)
         #expect(AppSettings(defaults: defaults).siriRemoteEnabled)
+        #expect(!membership.canUseSiriRemoteVoice)
         model.setSiriRemoteEnabled(false)
         #expect(!AppSettings(defaults: defaults).siriRemoteEnabled)
         #expect(model.siriRemoteAudioStatus == "disabled")
@@ -36,7 +74,7 @@ struct SiriRemoteActivationTests {
 
     @Test @MainActor func deferredAuthorizationSurvivesRelaunchUntilUserRetries() throws {
         let suite = "SiriActivation.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.siriRemoteEnabled = true

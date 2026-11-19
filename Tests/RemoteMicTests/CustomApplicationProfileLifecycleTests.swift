@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import RemoteMic
 
-/// 「APP 适配」的回归对象固定使用系统自带的文本编辑：它一定存在于每台 Mac 上，
+/// 「聚焦与翻页」的回归对象固定使用系统自带的文本编辑：它一定存在于每台 Mac 上，
 /// 不会像第三方 App 那样因为没装而让用例失效。
 @Suite("Custom application profile lifecycle")
 struct CustomApplicationProfileLifecycleTests {
@@ -32,7 +32,7 @@ struct CustomApplicationProfileLifecycleTests {
 
     private func makeSettings() throws -> (AppSettings, UserDefaults, String) {
         let name = "SayAll.ApplicationProfileLifecycle.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         return (AppSettings(defaults: defaults), defaults, name)
     }
 
