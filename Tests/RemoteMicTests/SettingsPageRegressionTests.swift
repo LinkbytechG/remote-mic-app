@@ -202,6 +202,9 @@ struct SettingsPageRegressionTests {
         #expect(modelSource.contains("beginWaitingForPreviousRemote(trigger: \"mapping_page\")"))
         #expect(modelSource.contains("reason=previous_remote_absent"))
         #expect(modelSource.contains("RemoteDeviceNamePolicy.fallbackSelection("))
+        // 自动回退只改变当前画布；已有首选设备时不得把回退目标写进持久化偏好。
+        #expect(modelSource.contains("let persistsFallback = settings.selectedRemoteProfileID == nil"))
+        #expect(modelSource.contains("persistSelection: persistsFallback"))
 
         // 用户手动点设备卡之后，连接事件不得把画布抢回小米。
         let settingsSource = try String(
@@ -301,6 +304,27 @@ struct SettingsPageRegressionTests {
         #expect(!settingsSource.contains("audio.action.learn_virtual_microphones"))
         #expect(!settingsSource.contains("audio.action.send_test_tone"))
         #expect(!settingsSource.contains("model.testToneStatus.text(using: localization)"))
+    }
+
+    /// Chromecast 在连接页只出现在左侧当前设备面板和“连接过的设备”，
+    /// 不得恢复独立的右侧连接卡片。
+    @Test func connectionPageHasNoSeparateChromecastCard() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let settingsSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        let modelSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/BridgeAppModel.swift"),
+            encoding: .utf8
+        )
+
+        #expect(!settingsSource.contains("chromecastConnectionCard"))
+        #expect(!modelSource.contains("isChromecastHIDPresent"))
+        #expect(settingsSource.contains("connectionRemotePhoto"))
     }
 
     @Test func connectionPageShowsVoiceKeyCompatibilityWarningOnlyFromModelState() throws {
