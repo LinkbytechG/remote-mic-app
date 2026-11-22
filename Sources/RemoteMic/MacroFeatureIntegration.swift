@@ -131,7 +131,7 @@ final class MacroFeatureIntegration: ObservableObject {
             keyCode: keyCode, modifiers: modifiers, deviceModifierFlags: deviceModifierFlags
         ) else { return .failed("快捷键配置无效") }
         guard accessibilityTrusted() else {
-            return .permissionDenied("需要辅助功能权限")
+            return .permissionDenied("需要辅助功能（新名称：设备控制和数据访问）权限")
         }
         return shortcutSender(shortcut)
             ? .userResultUnknown("快捷键已提交，目标App结果未知") : .failed("快捷键投递失败")
@@ -847,7 +847,35 @@ final class MacroFeatureIntegration: ObservableObject {
         #endif
     }
 
+    private lazy var deviceProfileInventoryLoaded: Bool = {
+        #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_PROFILE_AUTOSAVE
+        return buttonProfilesFeature.reloadMappingProfiles().success
+        #elseif canImport(SayAllButtonProfiles)
+        return false
+        #else
+        return true
+        #endif
+    }()
+
+    private func deviceScopedConfigurationReferences() -> Set<UUID>? {
+        guard deviceProfileInventoryLoaded else { return nil }
+        var references = Set<UUID>()
+        #if canImport(SayAllButtonProfiles)
+        references.formUnion(buttonProfilesFeature.allProfiles.compactMap(\.remoteProfileID))
+        #endif
+        #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        guard feature.hasLoadedLibrary else { return nil }
+        references.formUnion(feature.legacyBindings.compactMap { $0.device })
+        #elseif canImport(SayAllMacroRemoteMic)
+        return nil
+        #endif
+        return references
+    }
+
     func attachBindings(to settings: AppSettings, onProfileChange: @escaping (UUID?) -> Void) {
+        settings.privateRemoteProfileReferences = { [weak self] in
+            self?.deviceScopedConfigurationReferences()
+        }
         settings.interactionModeOverride = { [weak self, weak settings] _, button in
             guard settings?.customMappingEnabled == true else { return nil }
             return self?.profileHoldMode(button: button)
