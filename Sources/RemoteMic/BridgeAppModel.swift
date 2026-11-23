@@ -142,6 +142,20 @@ enum HIDMappingRecoveryPolicy {
         else { return nil }
         return retryDelays[attempt]
     }
+
+    /// 服务已经枚举出来、但写入后回读不一致时的重试间隔。
+    ///
+    /// 这一类的失败不能用 `hasMatchingServices` 当门槛：失败恰恰发生在服务存在、
+    /// 系统瞬时多枚举出一份重复服务的时刻，重复服务几秒内就会消失。2026-11-23
+    /// 的 RC003 现场只有一次 `reason=mapping_not_verified`，之后再不重试，整场
+    /// 按键都不被接管。
+    static func verificationFailedRetryDelay(
+        forAttempt attempt: Int,
+        started: Bool
+    ) -> TimeInterval? {
+        guard started, retryDelays.indices.contains(attempt) else { return nil }
+        return retryDelays[attempt]
+    }
 }
 
 enum MobileVoiceStopDisposition: Equatable {
@@ -1198,6 +1212,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var completedUpdateHIDRecoveryWorkItem: DispatchWorkItem?
     private var hidMappingRecoveryWorkItem: DispatchWorkItem?
     private var hidMappingRecoveryAttempt = 0
+    /// 服务已在、但写入回读不一致导致的重试计数；与「服务还枚举不出来」的预算分开，
+    /// 由一次成功接管清零，避免两条恢复路径互相重置。
+    private var hidVerificationRecoveryAttempt = 0
+    private var hidMappingRecoveryVerificationPending = false
     private var hidMappingRecoveryGeneration: UInt64 = 0
     private let audioPreparationQueue = DispatchQueue(label: "RemoteMic.audioPreparation", qos: .userInitiated)
     private var audioConfigurationGeneration: UInt64 = 0
@@ -2429,10 +2447,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         )
     }
 
-    private func recoverBluetoothVoiceLink(reason: String) {
+    private func recoverBluetoothVoiceLink(
+        reason: String,
+        trigger: RemoteConnectionRecoveryTrigger = .automatic
+    ) {
         let targets = Array(bluetoothBridges.values)
         AppLogger.shared.write(
-            "BLE RECOVERY phase=begin trigger=\(reason) target_bridges=\(targets.count) " +
+            "BLE RECOVERY phase=begin trigger=\(reason) recovery_trigger=\(trigger.rawValue) " +
+                "target_bridges=\(targets.count) " +
                 "configured_bridges=\(bluetoothBridges.count) " +
                 "discovery=\(discoveryBluetoothBridge != nil) " +
                 "ready_bridges=\(readyBluetoothBridgeCount)"
@@ -2444,8 +2466,42 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             return
         }
-        targets.forEach { $0.recoverVoiceLink(reason: reason) }
-        discoveryBluetoothBridge?.recoverVoiceLink(reason: reason)
+        targets.forEach { $0.recoverVoiceLink(reason: reason, trigger: trigger) }
+        if trigger != .systemWake {
+            discoveryBluetoothBridge?.recoverVoiceLink(reason: reason, trigger: trigger)
+        }
+    }
+
+    /// A voice-key press is explicit user intent. When the selected remote's
+    /// voice link is down, spend one assisted attempt instead of silently
+    /// ignoring the key. The HID event itself is never consumed here.
+    private func handleHIDVoiceUsageDown(profileID: UUID?) {
+        guard started,
+              let profileID,
+              profileID == settings.selectedRemoteProfileID
+        else { return }
+        guard !bluetoothVoiceActive, !isStreaming, !isPlayingTestTone else { return }
+        guard !isRemoteConnected(profileID) else { return }
+        guard let bridge = selectedBluetoothBridge else {
+            AppLogger.shared.write(
+                "VOICE KEY reconnect_skipped reason=no_bluetooth_link source=hid_voice_usage"
+            )
+            return
+        }
+        if bridge.isConnectionBusy {
+            AppLogger.shared.write(
+                "VOICE KEY reconnect_skipped reason=already_recovering source=hid_voice_usage"
+            )
+            return
+        }
+        AppLogger.shared.write(
+            "VOICE KEY reconnect_requested reason=voice_link_down source=hid_voice_usage"
+        )
+        if !bridge.reconnectNow(trigger: .voiceKey) {
+            AppLogger.shared.write(
+                "VOICE KEY reconnect_skipped reason=recovery_rejected source=hid_voice_usage"
+            )
+        }
     }
 
     private func setBluetoothSystemSuspended(_ suspended: Bool, reason: String) {
@@ -3057,8 +3113,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         audioPreparationQueue.async { [weak self] in
             let inputs = CoreAudioDeviceCatalog.inputDevices().filter { device in
                 let transport = CoreAudioDeviceCatalog.transportType(for: device.id)
-                return transport != kAudioDeviceTransportTypeVirtual &&
-                    transport != kAudioDeviceTransportTypeAggregate &&
+                return MacMicrophoneInputEligibilityPolicy.isSelectable(transport: transport) &&
                     VirtualAudioDeviceDiagnosticKind.classify(device) == .other
             }
             let builtInDeviceIDs = Set(inputs.compactMap { device in
@@ -3346,7 +3401,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         resumeVirtualAudioOutputIfNeeded(reason: "system_\(event.rawValue)")
         if BluetoothWakeRecoveryPolicy.shouldForceReconnect(event: event, started: started) {
-            recoverBluetoothVoiceLink(reason: "system_wake")
+            recoverBluetoothVoiceLink(reason: "system_wake", trigger: .systemWake)
         } else if BluetoothWakeRecoveryPolicy.shouldRecoverVoiceLinkAfterResume(
             started: started,
             configuredBridgeCount: bluetoothBridges.count,
@@ -4179,26 +4234,44 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     ///   服务还没枚举出来，而重连时蓝牙桥恰好可能还没回到 ready。
     private func scheduleHIDMappingRecoveryIfNeeded(
         restartSiriRemote: Bool = true,
-        requiresReadyBridge: Bool = true
+        requiresReadyBridge: Bool = true,
+        verificationFailed: Bool = false
     ) {
         guard hidMappingRecoveryWorkItem == nil else { return }
+        // 只在新增的校验失败路径上跳过"映射已关闭"：既有两条路径的重排条件保持不变。
+        if verificationFailed, !settings.customMappingEnabled { return }
         let hasMatchingServices = voiceFunctionMapper.hasMatchingServices
-        guard let delay = (requiresReadyBridge
-            ? HIDMappingRecoveryPolicy.retryDelay(
+        let delay: TimeInterval?
+        if verificationFailed {
+            delay = HIDMappingRecoveryPolicy.verificationFailedRetryDelay(
+                forAttempt: hidVerificationRecoveryAttempt,
+                started: started
+            )
+        } else if requiresReadyBridge {
+            delay = HIDMappingRecoveryPolicy.retryDelay(
                 forAttempt: hidMappingRecoveryAttempt,
                 started: started,
                 readyBridgeCount: readyBluetoothBridgeCount,
                 hasMatchingServices: hasMatchingServices
             )
-            : HIDMappingRecoveryPolicy.deviceVerificationRetryDelay(
+        } else {
+            delay = HIDMappingRecoveryPolicy.deviceVerificationRetryDelay(
                 forAttempt: hidMappingRecoveryAttempt,
                 started: started,
                 hasMatchingServices: hasMatchingServices
-            ))
-        else {
-            if started,
-               !hasMatchingServices,
-               hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
+            )
+        }
+        guard let delay else {
+            if verificationFailed,
+               started,
+               hidVerificationRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
+                AppLogger.shared.write(
+                    "HID MAPPING RECOVERY exhausted attempts=\(hidVerificationRecoveryAttempt) " +
+                        "ready_bridges=\(readyBluetoothBridgeCount) trigger=mapping_not_verified"
+                )
+            } else if started,
+                      !hasMatchingServices,
+                      hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
                 AppLogger.shared.write(
                     "HID MAPPING RECOVERY exhausted attempts=\(hidMappingRecoveryAttempt) " +
                         "ready_bridges=\(readyBluetoothBridgeCount) " +
@@ -4208,16 +4281,22 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             return
         }
 
-        let attempt = hidMappingRecoveryAttempt + 1
-        hidMappingRecoveryAttempt = attempt
+        let attempt = (verificationFailed ? hidVerificationRecoveryAttempt : hidMappingRecoveryAttempt) + 1
+        if verificationFailed {
+            hidVerificationRecoveryAttempt = attempt
+            hidMappingRecoveryVerificationPending = true
+        } else {
+            hidMappingRecoveryAttempt = attempt
+        }
         hidMappingRecoveryGeneration &+= 1
         let generation = hidMappingRecoveryGeneration
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.hidMappingRecoveryGeneration == generation else { return }
             self.hidMappingRecoveryWorkItem = nil
+            self.hidMappingRecoveryVerificationPending = false
             guard self.started,
                   !requiresReadyBridge || self.readyBluetoothBridgeCount > 0,
-                  !self.voiceFunctionMapper.hasMatchingServices
+                  verificationFailed || !self.voiceFunctionMapper.hasMatchingServices
             else {
                 self.cancelHIDMappingRecovery(reason: "conditions_changed")
                 return
@@ -4225,10 +4304,12 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             AppLogger.shared.write(
                 "HID MAPPING RECOVERY applying attempt=\(attempt) " +
                     "ready_bridges=\(self.readyBluetoothBridgeCount) " +
-                    "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
+                    "trigger=\(verificationFailed ? "mapping_not_verified" : Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
             )
             self.applyHIDSettings(restartSiriRemote: restartSiriRemote)
-            if !self.voiceFunctionMapper.hasMatchingServices {
+            // 校验失败类的重试不在这里自我续排：成功由 connected 状态收尾，
+            // 再次失败由新的回调重新排程，避免与 `completeHIDMappingRecoveryIfNeeded` 互相重置成死循环。
+            if !verificationFailed, !self.voiceFunctionMapper.hasMatchingServices {
                 self.scheduleHIDMappingRecoveryIfNeeded(
                     restartSiriRemote: restartSiriRemote,
                     requiresReadyBridge: requiresReadyBridge
@@ -4239,9 +4320,25 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         AppLogger.shared.write(
             "HID MAPPING RECOVERY scheduled attempt=\(attempt) " +
                 "delay_ms=\(Int(delay * 1_000)) ready_bridges=\(readyBluetoothBridgeCount) " +
-                "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
+                "trigger=\(verificationFailed ? "mapping_not_verified" : Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
         )
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    /// 一次成功接管（含"旁听但已中和"）会收尾校验失败类重试，避免计数跨会话累积。
+    private func noteHIDMappingVerifiedConnected() {
+        guard hidVerificationRecoveryAttempt > 0 else { return }
+        let attempts = hidVerificationRecoveryAttempt
+        hidVerificationRecoveryAttempt = 0
+        if hidMappingRecoveryVerificationPending {
+            hidMappingRecoveryVerificationPending = false
+            hidMappingRecoveryGeneration &+= 1
+            hidMappingRecoveryWorkItem?.cancel()
+            hidMappingRecoveryWorkItem = nil
+        }
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY completed attempts=\(attempts) trigger=mapping_not_verified"
+        )
     }
 
     private static func hidMappingRecoveryTrigger(_ requiresReadyBridge: Bool) -> String {
@@ -4553,7 +4650,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         monitor.onNativeMappingVerificationFailed = { [weak self] in
             self?.scheduleHIDMappingRecoveryIfNeeded(
                 restartSiriRemote: false,
-                requiresReadyBridge: false
+                requiresReadyBridge: false,
+                verificationFailed: true
             )
         }
         monitor.claimsRuntimeButton = { [weak self] profileID, button in
@@ -4606,6 +4704,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         monitor.onActiveButtons = { [weak self] profileID, buttons in
             guard let self, profileID == self.settings.selectedRemoteProfileID else { return }
             self.activeRemoteButtons = buttons
+        }
+        monitor.onVoiceUsageDown = { [weak self] profileID in
+            self?.handleHIDVoiceUsageDown(profileID: profileID)
         }
         monitor.onButtonPressed = { [weak self, weak monitor] profileID, fingerprint, button in
             guard let self, let monitor else {
@@ -5606,6 +5707,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         let readiness = RemoteFunctionReadiness.buttons(statusKey: value.key)
         let previous = remoteButtonReadiness.updateValue(readiness, forKey: profileID)
         logRemoteCardStatusChanges()
+
+        // 一次成功接管（含"旁听但已中和"）后收尾校验失败类重试。
+        if value.key.hasPrefix("button_mapping.status.connected") {
+            noteHIDMappingVerifiedConnected()
+        }
 
         guard previous != .ready, readiness == .ready,
               value.key.hasPrefix("button_mapping.status.connected") else { return }

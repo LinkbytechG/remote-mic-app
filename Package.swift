@@ -220,6 +220,19 @@ let profileAutosaveAvailable = [buttonProfilesPackagePath,
         return (try? String(contentsOf: api, encoding: .utf8))?.contains("func displayProfiles()") == true
     }
 } ?? false)
+/// 方案组件提供“宿主解析有效按住模式”的入口后，方案总览才能显示继承的基础按住。
+let profileResolvedHoldAvailable = [buttonProfilesPackagePath,
+    privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+        URL(fileURLWithPath: $0).appendingPathComponent("packages/macos-button-profiles").path
+    } : nil].compactMap { $0 }.contains { path in
+    let api = URL(fileURLWithPath: path).appendingPathComponent("Sources/SayAllButtonProfiles/RemoteMicButtonProfilesView.swift")
+    return (try? String(contentsOf: api, encoding: .utf8))?.contains("holdModeProvider") == true
+} || (privateArtifactPackagePath.map { path in
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let api = URL(fileURLWithPath: path).appendingPathComponent("Artifacts/SayAllButtonProfiles.xcframework/macos-arm64_x86_64/SayAllButtonProfiles.framework/Modules/SayAllButtonProfiles.swiftmodule/\(architecture)-apple-macos.swiftinterface")
+        return (try? String(contentsOf: api, encoding: .utf8))?.contains("holdModeProvider") == true
+    }
+} ?? false)
 let buttonProfilesTestAccessEnabled = ProcessInfo.processInfo.environment[
     "SAYALL_TEST_BUTTON_PROFILES_FREE"
 ] == "1"
@@ -257,6 +270,52 @@ let siriPermissionMonitorAvailable = [
 } ?? false)
 if siriPermissionMonitorAvailable {
     remoteMicSwiftSettings.append(.define("SAYALL_SIRI_PERMISSION_MONITOR"))
+}
+// Optional API probe: older Siri Remote components keep their original initializer and
+// render the legacy canvas. New components expose the enum, both closures, and both labels.
+func siriSourceDefinesProfileActionStyle(_ path: String) -> Bool {
+    let url = URL(fileURLWithPath: path)
+        .appendingPathComponent("Sources/SayAllSiriRemote/SiriRemoteMappingPage.swift")
+    guard let content = try? String(contentsOf: url, encoding: .utf8) else { return false }
+    return content.contains("public enum ActionSource: Equatable")
+        && content.contains("actionConfigured:")
+        && content.contains("actionSource:")
+        && content.contains("inherited:")
+        && content.contains("unavailable:")
+}
+
+func siriArtifactDefinesProfileActionStyle(_ path: String) -> Bool {
+    ["arm64", "x86_64"].allSatisfy { architecture in
+        let url = URL(fileURLWithPath: path).appendingPathComponent(
+            "Artifacts/SayAllSiriRemote.xcframework/macos-arm64_x86_64/SayAllSiriRemote.framework/Modules/SayAllSiriRemote.swiftmodule/\(architecture)-apple-macos.swiftinterface"
+        )
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
+            return false
+        }
+        return content.contains("enum ActionSource :")
+            && content.contains("actionConfigured:")
+            && content.contains("actionSource:")
+            && content.contains("inherited:")
+            && content.contains("unavailable:")
+    }
+}
+
+let siriProfileActionStyleAvailable: Bool
+if privateArtifactsAvailable, let path = privateArtifactPackagePath {
+    // Artifacts win over a simultaneously supplied source path; only the module that
+    // SwiftPM actually links may decide whether the host takes the new initializer.
+    siriProfileActionStyleAvailable = siriArtifactDefinesProfileActionStyle(path)
+} else {
+    let sourcePaths = [
+        siriRemotePackagePath,
+        privateSwiftPMEnabled ? privatePlatformPackagePath.map {
+            URL(fileURLWithPath: $0).appendingPathComponent("packages/audio-input-kit/siri-remote").path
+        } : nil,
+    ].compactMap { $0 }
+    siriProfileActionStyleAvailable = sourcePaths.contains(where: siriSourceDefinesProfileActionStyle)
+}
+if siriProfileActionStyleAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_SIRI_PROFILE_ACTION_STYLE"))
 }
 if membershipAuthorizedAccessAvailable {
     remoteMicSwiftSettings.append(.define("SAYALL_MEMBERSHIP_AUTHORIZED_ACCESS"))
@@ -360,6 +419,9 @@ let bindingTextAvailable = privateSwiftPMEnabled
     || (privateArtifactsAvailable
         && (privatePlatformManifestVersion.map { $0 >= bindingTextSince } ?? false))
 if bindingTextAvailable { remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_BINDING_TEXT")) }
+if profileResolvedHoldAvailable {
+    remoteMicSwiftSettings.append(.define("SAYALL_BUTTON_PROFILE_RESOLVED_HOLD"))
+}
 /// 截图/测试用的同步加载入口从这个版本起提供。
 let screenshotProfileSeedSince: (Int, Int, Int) = (2, 6, 3)
 let screenshotProfileSeedAvailable = privateSwiftPMEnabled

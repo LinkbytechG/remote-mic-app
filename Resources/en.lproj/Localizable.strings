@@ -1440,6 +1440,11 @@
 "button_mapping.hold.repeat_long.description" = "Repeat the long-press action after the configured long-press time. Release to stop.";
 "button_mapping.hold.repeat_single.description" = "Repeat the single-click action while held. Release to stop.";
 "button_mapping.hold.repeat_long.prefix" = "While held: repeat long-press action ";
+"button_mapping.hold.profile.once" = "Hold";
+"button_mapping.hold.profile.repeat_prefix" = "Hold: Repeat ";
+"button_mapping.hold.profile.repeat_long_prefix" = "Hold: Repeat Long Press ";
+"button_mapping.hold.profile.single_hold_prefix" = "Hold: Hold ";
+"button_mapping.hold.profile.long_hold_prefix" = "Hold: Long Press then Hold ";
 "button_mapping.hold.entry" = "While held";
 "button_mapping.hold.description" = "Run the selected behavior while held. Release to stop.";
 "button_mapping.hold.clear_long_to_enable" = "Clear long-press action";
@@ -1524,6 +1529,14 @@
 "button_mapping.save.unsupported" = "Read-only configuration";
 "button_mapping.binding.inherited" = "Inherits default profile";
 "button_mapping.binding.clear_override" = "Restore Default";
+"button_mapping.binding.unavailable_short" = "Reference unavailable";
+"button_mapping.binding.unavailable_detail" = "A shortcut or action referenced by this profile is missing on this Mac. The base mapping is used instead: %@. Choose another action below or restore the default.";
+"button_mapping.profile_unavailable.title" = "Unavailable references in this profile: %d";
+"button_mapping.profile_unavailable.detail" = "These bindings fall back to the base mapping instead of doing nothing. Re-select each action or clear all invalid overrides.";
+"button_mapping.profile_unavailable.clear" = "Clear Invalid Overrides";
+"button_mapping.profile_unavailable.cleared" = "Invalid overrides cleared: %d";
+"button_mapping.profile_unavailable.clear_failed" = "Invalid overrides cleared: %d. Some remain. Try again.";
+"button_mapping.profile_unavailable.reload_failed" = "Invalid overrides cleared: %d, but refreshing the profile failed. Try again.";
 "button_mapping.save.unavailable" = "Configuration unavailable";
 "button_mapping.save.retry" = "Retry";
 "button_mapping.save.partial" = "Action saved. Hold not saved.";
@@ -1531,7 +1544,7 @@
 "button_mapping.hold.cleared_by_action" = "Hold setting cleared because the action changed.";
 "button_mapping.hold.clear_failed_by_action" = "Action saved, but clearing the hold setting failed.";
 "button_mapping.action.no_action" = "Disabled";
-"button_mapping.action.profile_disabled" = "Disabled here";
+"button_mapping.action.profile_not_set" = "Not set";
 "button_mapping.source.profile" = "This Profile · %@";
 "button_mapping.profile.created" = "Key profile created";
 

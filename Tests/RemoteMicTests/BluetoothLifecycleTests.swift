@@ -179,10 +179,26 @@ struct BluetoothLifecycleTests {
         // 会话切回前台后必须能走到蓝牙语音链路恢复，并把触发原因写成稳定枚举。
         #expect(source.contains("BluetoothWakeRecoveryPolicy.shouldRecoverVoiceLinkAfterResume("))
         #expect(source.contains("recoverBluetoothVoiceLink(reason: \"session_activated\")"))
-        #expect(source.contains("recoverBluetoothVoiceLink(reason: \"system_wake\")"))
+        #expect(source.contains("recoverBluetoothVoiceLink(reason: \"system_wake\", trigger: .systemWake)"))
         // 恢复入口不能退回成「系统唤醒专用」的旧命名。
         #expect(!source.contains("recoverBluetoothAfterSystemWake"))
         #expect(!source.contains("recoverAfterSystemWake"))
+    }
+
+    @Test func voiceKeyIntentIsWiredToAssistedRecovery() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/BridgeAppModel.swift"),
+            encoding: .utf8
+        )
+
+        #expect(source.contains("monitor.onVoiceUsageDown ="))
+        #expect(source.contains("handleHIDVoiceUsageDown(profileID:"))
+        #expect(source.contains("bridge.reconnectNow(trigger: .voiceKey)"))
+        #expect(source.contains("VOICE KEY reconnect_requested reason=voice_link_down"))
     }
 
     @Test func everyBridgeFirstReadyReappliesHIDMappingsButDuplicateReadyDoesNot() {
@@ -269,6 +285,29 @@ struct BluetoothLifecycleTests {
             forAttempt: 0,
             started: true,
             hasMatchingServices: true
+        ) == nil)
+    }
+
+    /// 小米 2 Pro 现场：服务都在，但系统瞬时多枚举出一份重复服务，写入后回读不一致。
+    /// 这类失败必须也进入有限退避重试，否则一次失败就让整场会话不接管按键。
+    /// 与 `deviceVerificationRetryDelay` 的区别是**不能**用 `hasMatchingServices` 当门槛。
+    @Test func verificationFailureRetriesEvenWhenServicesExist() {
+        let delays = (0 ... 5).map {
+            HIDMappingRecoveryPolicy.verificationFailedRetryDelay(
+                forAttempt: $0,
+                started: true
+            )
+        }
+
+        #expect(delays == [0.5, 1, 2, 4, 8, nil])
+        #expect(HIDMappingRecoveryPolicy.verificationFailedRetryDelay(
+            forAttempt: 0,
+            started: false
+        ) == nil)
+        // 负索引与越界都必须收敛，不能无限重试。
+        #expect(HIDMappingRecoveryPolicy.verificationFailedRetryDelay(
+            forAttempt: -1,
+            started: true
         ) == nil)
     }
 

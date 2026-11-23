@@ -54,6 +54,8 @@ final class MacroFeatureIntegration: ObservableObject {
     private var enrollmentRevealRequested = false
     private var isPortableEditorActive = false
     private var isBindingEditorActive = false
+    private var isMigratingLegacyShortcutBindings = false
+    private var attemptedLegacyShortcutMigrationKeys = Set<String>()
 
 #if canImport(SayAllMacroRemoteMic)
     private let feature: SayAllMacroRemoteMicFeature
@@ -603,12 +605,40 @@ final class MacroFeatureIntegration: ObservableObject {
             button: button.rawValue, trigger: trigger.rawValue) else { return nil }
         switch binding {
         case let .host(reference):
-            // Corrupt or unknown explicit bindings are consumed, never inherited.
-            return (try? JSONDecoder().decode(ConfiguredButtonAction.self, from: reference.payload)) ?? .disabled
+            // A profile reference that cannot be decoded, or whose action cannot run,
+            // must not turn the physical button into a dead key. Returning nil lets the
+            // base mapping execute; the mapping page renders the same fallback.
+            guard let decoded = try? JSONDecoder().decode(
+                ConfiguredButtonAction.self,
+                from: reference.payload
+            ), decoded.action == .disabled || decoded.normalizedForExecution.action != .disabled
+            else { return nil }
+            if decoded.action == .combinationAction {
+                guard let macroID = decoded.macroID else { return nil }
+                #if canImport(SayAllMacroRemoteMic)
+                if feature.hasLoadedLibrary, feature.savedMacroVersion(id: macroID) == nil {
+                    return nil
+                }
+                #else
+                return nil
+                #endif
+            }
+            return decoded
         case let .macro(reference):
+            #if canImport(SayAllMacroRemoteMic)
+            // The macro library loads asynchronously. Treat a miss as invalid only after
+            // the initial read finishes, otherwise startup would execute a wrong base action.
+            if feature.hasLoadedLibrary, feature.savedMacroVersion(id: reference.macroID) == nil {
+                return nil
+            }
+            #else
+            // A macro reference is meaningless without the macro component; fall back
+            // to the base mapping instead of leaving the button unresponsive.
+            return nil
+            #endif
             return ConfiguredButtonAction(action: .combinationAction, shortcut: nil, macroID: reference.macroID)
         case let .shortcut(key):
-            guard let shortcut = buttonProfilesFeature.shortcut(id: key) else { return .disabled }
+            guard let shortcut = buttonProfilesFeature.shortcut(id: key) else { return nil }
             var flags = NSEvent.ModifierFlags(rawValue: UInt(shortcut.deviceModifierFlags ?? 0))
             for modifier in shortcut.modifiers {
                 switch modifier {
@@ -617,7 +647,7 @@ final class MacroFeatureIntegration: ObservableObject {
                 case "option": flags.insert(.option)
                 case "control": flags.insert(.control)
                 case "function": flags.insert(.function)
-                default: return .disabled
+                default: return nil
                 }
             }
             #if SAYALL_BUTTON_PROFILE_BINDING_TEXT
@@ -629,6 +659,18 @@ final class MacroFeatureIntegration: ObservableObject {
             return ConfiguredButtonAction(action: .customShortcut,
                 shortcut: CustomKeyboardShortcut(keyCode: shortcut.keyCode, modifierFlags: flags, keyLabel: keyLabel))
         case .focus:
+            // Focus targets live in the private component. Reuse its display resolution so a
+            // deleted focus profile falls back instead of silently focusing an unrelated target.
+            #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_PROFILE_AUTOSAVE
+            if let profileID = profile ?? buttonProfilesFeature.activeProfileID(for: device),
+               case .unavailable = buttonProfilesFeature.displayBinding(
+                   profile: profileID,
+                   button: button.rawValue,
+                   trigger: trigger.rawValue
+               ) {
+                return nil
+            }
+            #endif
             return ConfiguredButtonAction(action: .focusInput, shortcut: nil)
         }
         #else
@@ -905,6 +947,9 @@ final class MacroFeatureIntegration: ObservableObject {
         buttonProfilesFeature.changes.receive(on: DispatchQueue.main).sink { [weak self, weak settings] in
             DispatchQueue.main.async {
                 guard let self, let settings else { return }
+                #if SAYALL_BUTTON_PROFILE_AUTOSAVE && SAYALL_BUTTON_PROFILE_BINDING_TEXT
+                self.migrateLegacyShortcutBindingsIfNeeded()
+                #endif
                 let devices: [UUID?] = [nil] + settings.remoteDeviceProfiles.map { Optional($0.id) }
                 for device in devices {
                     let active = self.activeMappingProfileID(device: device)
@@ -919,8 +964,194 @@ final class MacroFeatureIntegration: ObservableObject {
                 settings.objectWillChange.send()
             }
         }.store(in: &subscriptions)
+        // The controller can finish its initial read before this subscription is installed.
+        #if SAYALL_BUTTON_PROFILE_AUTOSAVE && SAYALL_BUTTON_PROFILE_BINDING_TEXT
+        migrateLegacyShortcutBindingsIfNeeded()
+        #endif
         #endif
     }
+
+    #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION && SAYALL_BUTTON_PROFILE_AUTOSAVE && SAYALL_BUTTON_PROFILE_BINDING_TEXT
+    /// Rewrites resolvable legacy shortcut references into self-contained host actions.
+    /// Unresolved references are left untouched so the mapping page can keep warning and let
+    /// the user re-record or import the missing shortcut instead of silently losing intent.
+    func migrateLegacyShortcutBindingsIfNeeded() {
+        guard !isMigratingLegacyShortcutBindings,
+              !hasPendingPortableImport,
+              buttonProfilesFeature.buttonProfilesAccessDecision.permitsAccess
+        else { return }
+        #if canImport(SayAllMacroRemoteMic)
+        guard !feature.portableTransfer.isSaving else { return }
+        #endif
+        let candidates = legacyShortcutCandidates()
+        guard !candidates.isEmpty else { return }
+        // Do not mark unresolved refs: the shortcut library may still be loading, and a later
+        // change event must be allowed to retry them.
+        let resolvable = candidates.filter {
+            legacyShortcutMigrationPayload(profileKey: $0.profileKey) != nil
+        }
+        guard !resolvable.isEmpty else { return }
+        isMigratingLegacyShortcutBindings = true
+        defer { isMigratingLegacyShortcutBindings = false }
+
+        // Reload the profile document first: a just-committed import may still be waiting for
+        // the controller's asynchronous reload. Writing the old in-memory document would
+        // overwrite the imported profiles.
+        guard buttonProfilesFeature.reloadMappingProfiles().success else {
+            // Do not let a persistent reload failure re-trigger from its own change event.
+            attemptedLegacyShortcutMigrationKeys.formUnion(resolvable.map(\.migrationKey))
+            AppLogger.shared.write(
+                "BUTTON PROFILE MIGRATION operation_id=\(UUID().uuidString) " +
+                    "action=make_shortcut_self_contained phase=completed result=failed " +
+                    "reason=reload_failed candidates=\(resolvable.count)"
+            )
+            return
+        }
+        let profiles = buttonProfilesFeature.allProfiles
+        let operationID = UUID().uuidString
+        var candidatesCount = 0
+        var migrated = 0
+        var unresolved = 0
+        var failed = 0
+        for profile in profiles where buttonProfilesFeature.isButtonProfileEditable(profile: profile.id) {
+            for (key, binding) in profile.bindings {
+                guard case let .shortcut(profileKey) = binding else { continue }
+                let migrationKey = Self.legacyShortcutMigrationKey(profile: profile, key: key)
+                guard !attemptedLegacyShortcutMigrationKeys.contains(migrationKey) else {
+                    continue
+                }
+                guard let migration = legacyShortcutMigrationPayload(profileKey: profileKey) else {
+                    unresolved += 1
+                    continue
+                }
+                // Mark before the write: a failed write also emits a change event, and retrying
+                // the same key from that self-triggered event would create an unbounded loop.
+                attemptedLegacyShortcutMigrationKeys.insert(migrationKey)
+                candidatesCount += 1
+                let result = buttonProfilesFeature.writeBinding(
+                    .host(migration.reference),
+                    profile: profile.id,
+                    button: key.button.rawValue,
+                    trigger: key.trigger.rawValue
+                )
+                if result.success { migrated += 1 } else { failed += 1 }
+            }
+        }
+        guard candidatesCount > 0 || unresolved > 0 else { return }
+        let result = failed > 0 || unresolved > 0 ? "partial" : "passed"
+        AppLogger.shared.write(
+            "BUTTON PROFILE MIGRATION operation_id=\(operationID) " +
+                "action=make_shortcut_self_contained phase=completed result=\(result) " +
+                "profiles=\(profiles.count) candidates=\(candidatesCount) migrated=\(migrated) " +
+                "unresolved=\(unresolved) failed=\(failed)"
+        )
+    }
+
+    private struct LegacyShortcutCandidate {
+        let profile: RemoteMicButtonProfile
+        let key: RemoteMicButtonBindingKey
+        let profileKey: String
+        let migrationKey: String
+    }
+
+    private func legacyShortcutCandidates() -> [LegacyShortcutCandidate] {
+        buttonProfilesFeature.allProfiles.flatMap { profile -> [LegacyShortcutCandidate] in
+            guard buttonProfilesFeature.isButtonProfileEditable(profile: profile.id) else {
+                return []
+            }
+            return profile.bindings.compactMap { entry -> LegacyShortcutCandidate? in
+                guard case let .shortcut(profileKey) = entry.value else { return nil }
+                let migrationKey = Self.legacyShortcutMigrationKey(profile: profile, key: entry.key)
+                guard !attemptedLegacyShortcutMigrationKeys.contains(migrationKey) else {
+                    return nil
+                }
+                return LegacyShortcutCandidate(
+                    profile: profile,
+                    key: entry.key,
+                    profileKey: profileKey,
+                    migrationKey: migrationKey
+                )
+            }
+        }
+    }
+
+    private func legacyShortcutMigrationPayload(
+        profileKey: String
+    ) -> (reference: RemoteMicHostActionReference, configured: ConfiguredButtonAction)? {
+        guard let shortcut = buttonProfilesFeature.shortcut(id: profileKey),
+              let keyLabelForDisplay = buttonProfilesFeature.shortcutLabel(id: profileKey),
+              let configured = configuredShortcutAction(
+                  keyCode: shortcut.keyCode,
+                  modifiers: shortcut.modifiers,
+                  deviceModifierFlags: shortcut.deviceModifierFlags,
+                  keyLabel: keyLabelForDisplay
+              ),
+              let payload = try? JSONEncoder().encode(configured)
+        else { return nil }
+        let reference = RemoteMicHostActionReference(
+            id: "host.action.customShortcut",
+            displayName: Self.shortcutDisplayName(
+                keyLabel: keyLabelForDisplay,
+                modifierFlags: configured.shortcut?.modifierFlags ?? []
+            ),
+            payload: payload
+        )
+        return (reference, configured)
+    }
+
+    private static func legacyShortcutMigrationKey(
+        profile: RemoteMicButtonProfile,
+        key: RemoteMicButtonBindingKey
+    ) -> String {
+        "\(profile.id.uuidString).\(key.button.rawValue).\(key.trigger.rawValue)"
+    }
+
+    /// Converts one local shortcut record into the same executable action the mapping editor
+    /// writes. Unknown modifiers stay unresolved instead of producing a different key.
+    private func configuredShortcutAction(
+        keyCode: UInt16,
+        modifiers: [String],
+        deviceModifierFlags: UInt64?,
+        keyLabel: String
+    ) -> ConfiguredButtonAction? {
+        var flags = NSEvent.ModifierFlags(rawValue: UInt(deviceModifierFlags ?? 0))
+        for modifier in modifiers {
+            switch modifier {
+            case "command": flags.insert(.command)
+            case "shift": flags.insert(.shift)
+            case "option": flags.insert(.option)
+            case "control": flags.insert(.control)
+            case "function": flags.insert(.function)
+            default: return nil
+            }
+        }
+        return ConfiguredButtonAction(
+            action: .customShortcut,
+            shortcut: CustomKeyboardShortcut(
+                keyCode: keyCode,
+                modifierFlags: flags,
+                keyLabel: keyLabel
+            )
+        )
+    }
+
+    /// Host payload text is the fallback shown by the private profile page and the phone remote
+    /// when the opaque payload cannot be rendered. Include modifiers so migration does not turn
+    /// a visible `⌘C` into a bare `C`.
+    private static func shortcutDisplayName(
+        keyLabel: String,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> String {
+        let name = keyLabel.isEmpty ? "Custom Shortcut" : keyLabel
+        var prefix = ""
+        if modifierFlags.contains(.control) { prefix += "⌃" }
+        if modifierFlags.contains(.option) { prefix += "⌥" }
+        if modifierFlags.contains(.shift) { prefix += "⇧" }
+        if modifierFlags.contains(.command) { prefix += "⌘" }
+        if modifierFlags.contains(.function) { prefix += "fn " }
+        return prefix + name
+    }
+    #endif
 
     #if canImport(SayAllMacroRemoteMic) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
     private func migrateLegacyBindingsIfLoaded(to settings: AppSettings) {
@@ -1247,6 +1478,7 @@ final class MacroFeatureIntegration: ObservableObject {
         hostActionSections: [ButtonProfileHostActionSection],
         settings: AppSettings? = nil,
         holdSummaryProvider: ((UUID, String) -> String)? = nil,
+        holdModeProvider: ((UUID, String) -> String?)? = nil,
         onChooseApplication: ((@escaping (String) -> Void) -> Void)? = nil,
         onEditKeys: @escaping (UUID) -> Void = { _ in },
         onChooseCustomApplication: ((@escaping (String, String, Data) -> Void) -> Void)? = nil,
@@ -1254,35 +1486,28 @@ final class MacroFeatureIntegration: ObservableObject {
         membershipNotice: AnyView = AnyView(EmptyView())
     ) -> AnyView {
         #if canImport(SayAllButtonProfiles)
-        #if SAYALL_MACRO_REMOTE_CAPABILITIES
-        return buttonProfilesFeature.buttonProfilesView(
-            selectedRemoteProfileID: selectedRemoteProfileID,
-            remotePresentation: buttonProfilesRemotePresentation(for: remoteModel, chromecastReservedControlIDs: chromecastReservedControlIDs),
-            hostActionSections: hostActionSections.map { section in
-                RemoteMicHostActionSection(
-                    id: section.id,
-                    title: section.title,
-                    actions: section.actions.map { action in
-                        RemoteMicHostActionDescriptor(
-                            reference: RemoteMicHostActionReference(
-                                id: action.id,
-                                displayName: action.title,
-                                payload: action.payload
-                            ),
-                            detail: action.detail,
-                            systemImage: action.systemImage,
-                            isAvailable: action.isAvailable
-                        )
-                    }
-                )
-            },
-            baseBindingSummaries: settings.map { baseBindingSummaries($0, remoteProfileID: selectedRemoteProfileID) } ?? [],
-            holdSummaryProvider: holdSummaryProvider,
-            onChooseApplication: onChooseApplication,
-            onEditKeys: onEditKeys,
-            membershipNotice: membershipNotice,
-            onChooseCustomApplication: onChooseCustomApplication.map { callback in
-                { completion in
+        let mappedHostActionSections = hostActionSections.map { section in
+            RemoteMicHostActionSection(
+                id: section.id,
+                title: section.title,
+                actions: section.actions.map { action in
+                    RemoteMicHostActionDescriptor(
+                        reference: RemoteMicHostActionReference(
+                            id: action.id,
+                            displayName: action.title,
+                            payload: action.payload
+                        ),
+                        detail: action.detail,
+                        systemImage: action.systemImage,
+                        isAvailable: action.isAvailable
+                    )
+                }
+            )
+        }
+        let summaries = settings.map { baseBindingSummaries($0, remoteProfileID: selectedRemoteProfileID) } ?? []
+        let applicationCallback: ((@escaping (RemoteMicHostActionReference) -> Void) -> Void)? =
+            onChooseCustomApplication.map { callback in
+                { (completion: @escaping (RemoteMicHostActionReference) -> Void) in
                     callback { id, displayName, payload in
                         completion(RemoteMicHostActionReference(
                             id: id,
@@ -1292,44 +1517,60 @@ final class MacroFeatureIntegration: ObservableObject {
                     }
                 }
             }
+        #if SAYALL_MACRO_REMOTE_CAPABILITIES
+        let presentation = buttonProfilesRemotePresentation(
+            for: remoteModel,
+            chromecastReservedControlIDs: chromecastReservedControlIDs
+        )
+        #if SAYALL_BUTTON_PROFILE_RESOLVED_HOLD
+        return buttonProfilesFeature.buttonProfilesView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            remotePresentation: presentation,
+            hostActionSections: mappedHostActionSections,
+            baseBindingSummaries: summaries,
+            holdSummaryProvider: holdSummaryProvider,
+            holdModeProvider: holdModeProvider,
+            onChooseApplication: onChooseApplication,
+            onEditKeys: onEditKeys,
+            membershipNotice: membershipNotice,
+            onChooseCustomApplication: applicationCallback
         )
         #else
         return buttonProfilesFeature.buttonProfilesView(
             selectedRemoteProfileID: selectedRemoteProfileID,
-            hostActionSections: hostActionSections.map { section in
-                RemoteMicHostActionSection(
-                    id: section.id,
-                    title: section.title,
-                    actions: section.actions.map { action in
-                        RemoteMicHostActionDescriptor(
-                            reference: RemoteMicHostActionReference(
-                                id: action.id,
-                                displayName: action.title,
-                                payload: action.payload
-                            ),
-                            detail: action.detail,
-                            systemImage: action.systemImage,
-                            isAvailable: action.isAvailable
-                        )
-                    }
-                )
-            },
-            baseBindingSummaries: settings.map { baseBindingSummaries($0, remoteProfileID: selectedRemoteProfileID) } ?? [],
+            remotePresentation: presentation,
+            hostActionSections: mappedHostActionSections,
+            baseBindingSummaries: summaries,
             holdSummaryProvider: holdSummaryProvider,
             onChooseApplication: onChooseApplication,
             onEditKeys: onEditKeys,
-            onChooseCustomApplication: onChooseCustomApplication.map { callback in
-                { completion in
-                    callback { id, displayName, payload in
-                        completion(RemoteMicHostActionReference(
-                            id: id,
-                            displayName: displayName,
-                            payload: payload
-                        ))
-                    }
-                }
-            }
+            membershipNotice: membershipNotice,
+            onChooseCustomApplication: applicationCallback
         )
+        #endif
+        #else
+        #if SAYALL_BUTTON_PROFILE_RESOLVED_HOLD
+        return buttonProfilesFeature.buttonProfilesView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            hostActionSections: mappedHostActionSections,
+            baseBindingSummaries: summaries,
+            holdSummaryProvider: holdSummaryProvider,
+            holdModeProvider: holdModeProvider,
+            onChooseApplication: onChooseApplication,
+            onEditKeys: onEditKeys,
+            onChooseCustomApplication: applicationCallback
+        )
+        #else
+        return buttonProfilesFeature.buttonProfilesView(
+            selectedRemoteProfileID: selectedRemoteProfileID,
+            hostActionSections: mappedHostActionSections,
+            baseBindingSummaries: summaries,
+            holdSummaryProvider: holdSummaryProvider,
+            onChooseApplication: onChooseApplication,
+            onEditKeys: onEditKeys,
+            onChooseCustomApplication: applicationCallback
+        )
+        #endif
         #endif
         #else
         return AnyView(EmptyView())
