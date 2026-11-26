@@ -640,6 +640,14 @@ enum VoiceKeyCompatibilityWarning: Equatable {
     }
 }
 
+private struct PendingMacroFeedback {
+    let actionID: String
+    let actionName: String
+    let stepCount: Int?
+    let configured: ConfiguredButtonAction
+    let strings: ActionFeedbackStrings
+}
+
 final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDelegate, AVAudioPlayerDelegate {
     private static let longRecordingOpenTimeout: TimeInterval = 5
     private static let longRecordingCloseTimeout: TimeInterval = 2
@@ -765,8 +773,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         ButtonAction,
         CustomKeyboardShortcut?,
         CustomApplicationProfile?,
-        Bool
+        Bool,
+        @escaping (Bool) -> Void
     ) -> Bool
+    private var pendingMacroFeedback: PendingMacroFeedback?
+    private var macroFeedbackByOperation: [String: PendingMacroFeedback] = [:]
     private let customApplicationURLResolver: (String) -> URL?
     private var recordingPlayback: AVAudioPlayer?
 
@@ -1160,6 +1171,13 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var chromecastAudioSampleCount = 0
     private var chromecastAudioEnqueueFailureCount = 0
     private var loggedChromecastInactiveAudioDrop = false
+    /// Chromecast 会话「长时间没有声音」的检测与一次性提示。
+    ///
+    /// toggle 模式下没有物理按住这个事实可依赖：用户说完忘了按第二次时，
+    /// 界面和输入法都会一直停在录音态。这里只负责让用户看见，不结束会话。
+    private var chromecastSilenceTracker = VoiceSilenceNoticeTracker()
+    private var chromecastSilenceTimer: Timer?
+    private var chromecastSilenceNotice: VoiceSilenceNoticeController?
     private var loggedChromecastAudioDevice = false
     /// 设置页展示用。私有包缺失时恒为 `.unavailable`，界面据此隐藏整块内容。
     @Published private(set) var chromecastStatus: ChromecastLinkStatus =
@@ -1255,13 +1273,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             ButtonAction,
             CustomKeyboardShortcut?,
             CustomApplicationProfile?,
-            Bool
+            Bool,
+            @escaping (Bool) -> Void
         ) -> Bool = {
             KeyboardInjector.send(
                 $0,
                 shortcut: $1,
                 applicationProfile: $2,
-                focusCustomApplication: $3
+                focusCustomApplication: $3,
+                completion: $4
             )
         },
         customApplicationURLResolver: @escaping (String) -> URL? = {
@@ -1279,6 +1299,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         self.externalActionSender = externalActionSender
         self.customApplicationURLResolver = customApplicationURLResolver
         super.init()
+        macroFeature.onMacroExecutionEvent = { [weak self] operationID, phase, terminal, elapsed in
+            self?.handleMacroFeedbackEvent(
+                operationID: operationID,
+                phase: phase,
+                terminal: terminal,
+                elapsedMilliseconds: elapsed
+            )
+        }
         siriRemoteCursorFeedback.setVisualFeedbackEnabled(
             settings.siriRemoteCursorFeedbackVisible
         )
@@ -6418,8 +6446,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         if configured.action.isAppInternal {
             handled = performInternalAction(configured.action, source: "apple:\(profileID.uuidString)")
         } else {
-            guard KeyboardInjector.isAccessibilityTrusted else {
-                _ = KeyboardInjector.requestAccessibilityAccess()
+            guard requireAccessibilityForAction(configured) else {
                 AppLogger.shared.write(
                     "APPLE REMOTE BUTTON phase=failed result=accessibility_required " +
                         "button=\(button.rawValue) trigger=\(trigger.rawValue)"
@@ -9120,8 +9147,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             return handled
         }
-        guard KeyboardInjector.isAccessibilityTrusted else {
-            _ = KeyboardInjector.requestAccessibilityAccess()
+        guard requireAccessibilityForAction(configured) else {
             return false
         }
         guard performExternalConfiguredAction(configured) else {
@@ -9193,10 +9219,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         if configured.action.isAppInternal {
             return performInternalAction(configured.action, source: source)
         }
-        guard KeyboardInjector.isAccessibilityTrusted else {
-            _ = KeyboardInjector.requestAccessibilityAccess()
-            return false
-        }
+        guard requireAccessibilityForAction(configured) else { return false }
         return performExternalConfiguredAction(configured)
     }
 
@@ -9207,14 +9230,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         guard let shortcut = KeyboardInjector.recordedShortcut(
             keyCode: keyCode, modifiers: modifiers, deviceModifierFlags: deviceModifierFlags
         ) else { return false }
-        guard KeyboardInjector.isAccessibilityTrusted else {
-            _ = KeyboardInjector.requestAccessibilityAccess()
-            return false
-        }
-        return performExternalConfiguredAction(ConfiguredButtonAction(
-            action: .customShortcut,
-            shortcut: shortcut
-        ))
+        let configured = ConfiguredButtonAction(action: .customShortcut, shortcut: shortcut)
+        guard requireAccessibilityForAction(configured) else { return false }
+        return performExternalConfiguredAction(configured)
     }
 
     /// 「按住执行」开始：把方向键真正按下去，由系统按键盘节奏重复，直到松键。
@@ -9232,15 +9250,95 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
 
     @discardableResult
     func performExternalConfiguredAction(_ configured: ConfiguredButtonAction) -> Bool {
+        let configured = configured.normalizedForExecution
+        guard configured.action != .disabled else { return true }
+        if configured.action.isAppInternal {
+            return performInternalAction(configured.action)
+        }
+        guard !configured.action.requiresAccessibilityForAction
+                || KeyboardInjector.isAccessibilityTrusted else {
+            return requireAccessibilityForAction(configured)
+        }
+
+        let localization = LocalizationStore(
+            settings: settings,
+            resourceBundle: RemoteMicResourceBundle.mainOrDevelopment
+        )
+        let strings = ActionFeedbackStrings(localization: localization)
+        let actionID = configured.action.rawValue
+        let actionName = actionFeedbackName(for: configured, localization: localization)
+        let stepCount = actionFeedbackStepCount(for: configured)
+        let presentsSuccess = settings.showActionFeedback
+            && settings.showActionSuccessFeedback
+            && configured.showsActionSuccessFeedback
+        let presentsFailure = settings.showActionFeedback
+        let handlers = actionFeedbackHandlers(for: configured)
+        let operationID = UUID().uuidString
+        let startedUptime = ProcessInfo.processInfo.systemUptime
+        let completionGate = ActionFeedbackCompletionGate()
+
+        func elapsedMilliseconds() -> Int {
+            max(0, Int((ProcessInfo.processInfo.systemUptime - startedUptime) * 1_000))
+        }
+
+        func report(_ result: ActionFeedbackResult) {
+            guard completionGate.take() else { return }
+            let event = ActionFeedbackEvent(
+                operationID: operationID,
+                actionID: actionID,
+                actionName: actionName,
+                result: result,
+                elapsedMilliseconds: elapsedMilliseconds(),
+                stepCount: stepCount,
+                presentsSuccess: presentsSuccess,
+                presentsFailure: presentsFailure
+            )
+            Task { @MainActor in
+                ActionFeedbackCenter.shared.record(
+                    event,
+                    strings: strings,
+                    handlers: handlers
+                )
+            }
+        }
+
+        func reportFailure(_ kind: ActionFeedbackFailureKind) {
+            report(.failure(kind))
+        }
+
         guard !macroFeature.hasPendingPortableImport else {
-            presentButtonActionFailureNotice()
+            reportFailure(.configurationUnavailable)
             return false
         }
+
         if configured.action == .combinationAction {
-            let handled = macroFeature.executeMacro(id: configured.macroID)
-            if !handled { presentButtonActionFailureNotice() }
-            return handled
+            if macroFeature.hasLoadedMacroLibrary,
+               !macroFeature.hasMacro(id: configured.macroID) {
+                reportFailure(.configurationUnavailable)
+                return false
+            }
+            pendingMacroFeedback = PendingMacroFeedback(
+                actionID: actionID,
+                actionName: actionName,
+                stepCount: stepCount,
+                configured: configured,
+                strings: strings
+            )
+            let accepted = macroFeature.executeMacro(id: configured.macroID)
+            guard accepted else {
+                pendingMacroFeedback = nil
+                reportFailure(.notStarted)
+                return false
+            }
+            return true
         }
+
+        if configured.action.presetApplication != nil,
+           actionFeedbackApplicationURL(for: configured) == nil {
+            reportFailure(.targetMissing)
+            return false
+        }
+
         let applicationProfile = settings.customApplicationProfile(
             id: configured.applicationProfileID
         )
@@ -9262,7 +9360,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     "BUTTON ACTION action=openCustomApplication phase=failed " +
                         "result=unavailable reason=profile_or_application_missing"
                 )
-                presentButtonActionFailureNotice()
+                reportFailure(
+                    applicationProfile == nil ? .configurationUnavailable : .targetMissing
+                )
                 return false
             case .open(let focusAllowed):
                 customApplicationFocusAllowed = focusAllowed
@@ -9285,24 +9385,192 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             configured.shortcut,
             applicationProfile,
             customApplicationFocusAllowed
-        )
-        if !handled {
-            presentButtonActionFailureNotice()
-            if let requestID {
-                voiceInputDestinationCoordinator.cancel(requestID: requestID, reason: .actionFailed)
-            }
+        ) { success in
+            report(
+                success
+                    ? .success
+                    : self.actionFeedbackFailure(
+                        for: configured,
+                        elapsedMilliseconds: elapsedMilliseconds()
+                    )
+            )
         }
-        return handled
+        guard handled else {
+            report(actionFeedbackFailure(
+                for: configured,
+                elapsedMilliseconds: elapsedMilliseconds()
+            ))
+            if let requestID {
+                voiceInputDestinationCoordinator.cancel(
+                    requestID: requestID,
+                    reason: .actionFailed
+                )
+            }
+            return false
+        }
+        return true
     }
 
-    private func presentButtonActionFailureNotice() {
+    private func actionFeedbackName(
+        for configured: ConfiguredButtonAction,
+        localization: LocalizationStore
+    ) -> String {
+        switch configured.action {
+        case .combinationAction:
+            return macroFeature.macroName(id: configured.macroID)
+                ?? localization.text("action.combination_action")
+        case .customShortcut:
+            return localization.text("action.custom_shortcut")
+        case .openCustomApplication:
+            guard let profile = settings.customApplicationProfile(
+                id: configured.applicationProfileID
+            ) else {
+                return localization.text("custom_application.not_configured")
+            }
+            return String(
+                format: localization.text("action_feedback.open_application_name"),
+                locale: localization.locale,
+                arguments: [profile.displayName]
+            )
+        default:
+            return configured.action.displayName(using: localization)
+        }
+    }
+
+    private func actionFeedbackStepCount(for configured: ConfiguredButtonAction) -> Int? {
+        guard configured.action == .combinationAction else { return nil }
+        return macroFeature.macroStepCount(id: configured.macroID)
+    }
+
+    private func actionFeedbackApplicationURL(
+        for configured: ConfiguredButtonAction
+    ) -> URL? {
+        if let preset = configured.action.presetApplication {
+            if preset == .remoteMic { return Bundle.main.bundleURL }
+            return NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: preset.bundleIdentifier
+            )
+        }
+        guard configured.action == .openCustomApplication,
+              let profile = settings.customApplicationProfile(
+                  id: configured.applicationProfileID
+              )
+        else { return nil }
+        return customApplicationURLResolver(profile.bundleIdentifier)
+    }
+
+    private func actionFeedbackHandlers(
+        for configured: ConfiguredButtonAction
+    ) -> ActionFeedbackActionHandlers {
+        var handlers = ActionFeedbackActionHandlers()
+        handlers.retry = { [weak self] in
+            self?.performExternalConfiguredAction(configured)
+        }
+        if let url = actionFeedbackApplicationURL(for: configured) {
+            handlers.openApplication = {
+                if !NSWorkspace.shared.open(url) {
+                    AppLogger.shared.write(
+                        "ACTION FEEDBACK phase=open_application result=failed " +
+                            "action_id=\(configured.action.rawValue)"
+                    )
+                }
+            }
+        }
+        return handlers
+    }
+
+    private func actionFeedbackFailure(
+        for configured: ConfiguredButtonAction,
+        elapsedMilliseconds: Int
+    ) -> ActionFeedbackResult {
+        if configured.action == .focusInput, elapsedMilliseconds >= 9_000 {
+            return .timedOut
+        }
+        switch configured.action {
+        case .customShortcut:
+            return .failure(.shortcutNotDelivered)
+        case .openCustomApplication:
+            return .failure(.targetUnavailable)
+        case .focusInput:
+            return .failure(.executionFailed)
+        case .pageUp, .pageDown, .pageUpHalf, .pageDownHalf,
+             .scrollToTop, .scrollToBottom:
+            return .failure(.executionFailed)
+        case .appSwitcher:
+            return .failure(.executionFailed)
+        default:
+            if configured.action.presetApplication != nil {
+                return .failure(.targetUnavailable)
+            }
+            return .failure(.shortcutNotDelivered)
+        }
+    }
+
+    private func requireAccessibilityForAction(
+        _ configured: ConfiguredButtonAction
+    ) -> Bool {
+        guard !KeyboardInjector.isAccessibilityTrusted else { return true }
+        _ = KeyboardInjector.requestAccessibilityAccess()
+        let localization = LocalizationStore(
+            settings: settings,
+            resourceBundle: RemoteMicResourceBundle.mainOrDevelopment
+        )
+        let strings = ActionFeedbackStrings(localization: localization)
+        let event = ActionFeedbackEvent(
+            operationID: UUID().uuidString,
+            actionID: configured.action.rawValue,
+            actionName: actionFeedbackName(for: configured, localization: localization),
+            result: .failure(.permissionDenied),
+            elapsedMilliseconds: 0,
+            presentsSuccess: false,
+            presentsFailure: settings.showActionFeedback
+        )
+        let handlers = actionFeedbackHandlers(for: configured)
         Task { @MainActor in
-            NoticeCenter.shared.show(Notice(
-                tier: .warning,
-                title: noticeLocalized("button_mapping.action_failed.title"),
-                text: noticeLocalized("button_mapping.action_failed.detail"),
-                position: .bottom
-            ))
+            ActionFeedbackCenter.shared.record(
+                event,
+                strings: strings,
+                handlers: handlers
+            )
+        }
+        return false
+    }
+
+    private func handleMacroFeedbackEvent(
+        operationID: String,
+        phase: String,
+        terminal: String,
+        elapsedMilliseconds: Int
+    ) {
+        if phase == "submitted", terminal == "accepted" {
+            if let pending = pendingMacroFeedback {
+                macroFeedbackByOperation[operationID] = pending
+                pendingMacroFeedback = nil
+            }
+            return
+        }
+        guard phase == "completed",
+              let pending = macroFeedbackByOperation.removeValue(forKey: operationID)
+        else { return }
+        let event = ActionFeedbackEvent(
+            operationID: operationID,
+            actionID: pending.actionID,
+            actionName: pending.actionName,
+            result: ActionFeedbackMacroClassifier.result(forTerminal: terminal),
+            elapsedMilliseconds: elapsedMilliseconds,
+            stepCount: pending.stepCount,
+            presentsSuccess: settings.showActionFeedback
+                && settings.showActionSuccessFeedback
+                && pending.configured.showsActionSuccessFeedback,
+            presentsFailure: settings.showActionFeedback
+        )
+        let handlers = actionFeedbackHandlers(for: pending.configured)
+        Task { @MainActor in
+            ActionFeedbackCenter.shared.record(
+                event,
+                strings: pending.strings,
+                handlers: handlers
+            )
         }
     }
 
@@ -10936,6 +11204,54 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     /// 0.5s 覆盖中位情形：开读窗口的丢失从最坏 ~0.4s 压到 ~0.1s，代价是识别出字整体晚 0.5s。
     private static let chromecastAudioPrerollDelay: TimeInterval = 0.5
 
+    // MARK: - 静默提示
+
+    /// 会话开始时启动每秒检查。旧会话的音频时刻不能拿来判断新会话。
+    private func startChromecastSilenceMonitoring() {
+        stopChromecastSilenceMonitoring(closeNotice: true, reason: "session_restart")
+        chromecastSilenceTracker.beginSession()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.checkChromecastSilence()
+        }
+        // `.common` 才能在菜单、拖拽等交互模式下继续走。
+        RunLoop.main.add(timer, forMode: .common)
+        chromecastSilenceTimer = timer
+    }
+
+    private func stopChromecastSilenceMonitoring(closeNotice: Bool, reason: String) {
+        chromecastSilenceTimer?.invalidate()
+        chromecastSilenceTimer = nil
+        chromecastSilenceTracker.endSession()
+        if closeNotice {
+            chromecastSilenceNotice?.dismiss(reason: reason)
+        }
+    }
+
+    private func checkChromecastSilence() {
+        guard chromecastVoiceActive || pendingChromecastVoiceStart else {
+            stopChromecastSilenceMonitoring(closeNotice: true, reason: "session_inactive")
+            return
+        }
+        guard chromecastSilenceTracker.consumePresentationIfDue(
+            now: ProcessInfo.processInfo.systemUptime
+        ) else { return }
+        let localization = LocalizationStore(settings: settings)
+        let notice = chromecastSilenceNotice ?? {
+            let created = VoiceSilenceNoticeController { message in
+                AppLogger.shared.write(message)
+            }
+            chromecastSilenceNotice = created
+            return created
+        }()
+        notice.present(
+            title: localization.text("voice_silence_notice.title"),
+            text: String(
+                format: localization.text("voice_silence_notice.text"),
+                Int(VoiceSilenceNoticeTracker.silenceThreshold)
+            )
+        )
+    }
+
     private func beginChromecastVoice() {
         guard !macMicrophoneState.isActive else {
             AppLogger.shared.write("CHROMECAST VOICE phase=rejected reason=mac_microphone_busy")
@@ -11091,9 +11407,13 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 "audio_source=chromecast_microphone route=MiRemoteV_2ch " +
                 "mode=\(effectiveChromecastVoiceMode.rawValue)"
         )
+        startChromecastSilenceMonitoring()
     }
 
     private func endChromecastVoice(reason: ChromecastVoiceEndReason) {
+        // 会话一旦收尾，静默提示就没有意义了；后续若被「快速再按」续用，
+        // beginChromecastVoice 会重新开始计时。
+        stopChromecastSilenceMonitoring(closeNotice: true, reason: "session_ended")
         if pendingChromecastVoiceStart {
             pendingChromecastVoiceStopReason = reason
             if chromecastVoiceActive {
@@ -11484,8 +11804,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             return handled
         }
-        guard KeyboardInjector.isAccessibilityTrusted else {
-            _ = KeyboardInjector.requestAccessibilityAccess()
+        guard requireAccessibilityForAction(configured) else {
             AppLogger.shared.write(
                 "CHROMECAST ACTION phase=failed result=accessibility_required " +
                     "button=\(button.rawValue) trigger=\(trigger.rawValue)"
@@ -11523,6 +11842,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
             return
         }
+        // 只要真的收到过音频，后面的静默才有意义：VAD 门控下「开麦未开口」是 0 帧。
+        chromecastSilenceTracker.audioReceived(at: ProcessInfo.processInfo.systemUptime)
         if pendingChromecastVoiceStart,
            pendingChromecastVoiceAudio.appendIfWaiting(samples) {
             AppLogger.shared.write(
